@@ -1,4 +1,4 @@
 approvers:
-- fredkan
-- xianlubird 
-- haoshuwei
+- openshift-storage-maintainers
+component: "Storage"
+subcomponent: Kubernetes External Components
