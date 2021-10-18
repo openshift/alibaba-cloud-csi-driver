@@ -23,7 +23,7 @@ import (
 	aliNas "github.com/aliyun/alibaba-cloud-sdk-go/services/nas"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-csi/drivers/pkg/csi-common"
-	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/cnfs/v1alpha1"
+	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/cnfs/v1beta1"
 	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/utils"
 	log "github.com/sirupsen/logrus"
 	"go.uber.org/ratelimit"
@@ -88,6 +88,7 @@ const (
 	LosetupType = "losetup"
 
 	allowVolumeExpansion = "allowVolumeExpansion"
+	csiAlibabaCloudName  = "csi.alibabacloud.com"
 )
 
 // controller server try to create/delete volumes
@@ -392,7 +393,6 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 
 		if !GlobalConfigVar.NasFakeProvision || losetupType {
 			// local mountpoint for one volume
-
 			cs.rateLimiter.Take()
 			// step5: Mount nfs server to localpath
 			if !CheckNfsPathMounted(mountPoint, nfsServer, nfsPath) {
@@ -470,9 +470,47 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 			CapacityBytes: int64(volSizeBytes),
 			VolumeContext: volumeContext,
 		}
+	} else if nasVol.VolumeAs == "sharepath" {
+		reclaimPolicy, ok := req.Parameters[csiAlibabaCloudName+"/"+"reclaimPolicy"]
+		if ok && reclaimPolicy != "Retain" {
+			err := fmt.Sprintf("Use sharepath mode, reclaimPolicy must be Retain. The current reclaimPolicy is %s", reclaimPolicy)
+			log.Error(err)
+			return nil, errors.New(err)
+		}
+		nfsServerInputs := nasVol.Server
+		nfsServer, nfsPath := GetNfsDetails(nfsServerInputs)
+		if nfsServer == "" || nfsPath == "" {
+			log.Errorf("CreateVolume: Input nfs server format error: volume: %s, server: %s", req.Name, nfsServerInputs)
+			return nil, fmt.Errorf("CreateVolume: Input nfs server format error: volume: %s, server: %s", req.Name, nfsServerInputs)
+		}
+		volumeContext["volumeAs"] = nasVol.VolumeAs
+		volumeContext["path"] = nfsPath
+		if len(nasVol.CnfsName) != 0 {
+			volumeContext[ContainerNetworkFileSystem] = nasVol.CnfsName
+			delete(volumeContext, "server")
+		} else {
+			volumeContext["server"] = nfsServer
+		}
+		if !pvMntOptionsVersSet {
+			volumeContext["vers"] = nfsVersion
+		}
+		if nasVol.Mode != "" {
+			volumeContext["mode"] = nasVol.Mode
+			volumeContext["modeType"] = nasVol.ModeType
+		}
+		if value, ok := req.Parameters["options"]; ok && value != "" {
+			volumeContext["options"] = value
+		}
+
+		volSizeBytes := int64(req.GetCapacityRange().GetRequiredBytes())
+		csiTargetVol = &csi.Volume{
+			VolumeId:      req.Name,
+			CapacityBytes: int64(volSizeBytes),
+			VolumeContext: volumeContext,
+		}
 	} else {
-		log.Errorf("CreateVolume: volumeAs should be set as subpath/filesystem: %s", nasVol.VolumeAs)
-		return nil, errors.New("CreateVolume: volumeAs should be set as subpath/filesystem: " + nasVol.VolumeAs)
+		log.Errorf("CreateVolume: volumeAs should be set as subpath/filesystem/sharepath: %s", nasVol.VolumeAs)
+		return nil, errors.New("CreateVolume: volumeAs should be set as subpath/filesystem/sharepath: " + nasVol.VolumeAs)
 	}
 
 	pvcProcessSuccess[pvName] = csiTargetVol
@@ -507,6 +545,12 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 	}
 	if value, ok := pvInfo.Spec.CSI.VolumeAttributes["server"]; ok {
 		nfsServer = value
+	} else if value, ok := pvInfo.Spec.CSI.VolumeAttributes[ContainerNetworkFileSystem]; ok {
+		server, err := v1beta1.GetContainerNetworkFileSystemServer(cs.crdClient, value)
+		if err != nil {
+			return nil, err
+		}
+		nfsServer = server
 	} else {
 		return nil, fmt.Errorf("DeleteVolume: Volume Spec with nfs server empty: %s, CSI: %v", req.VolumeId, pvInfo.Spec.CSI)
 	}
@@ -581,9 +625,7 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 			log.Infof("DeleteVolume: Nas Volume %s Filesystem's deleteVolume is [false], skip delete mountTarget and fileSystem", req.VolumeId)
 		}
 
-	}
-
-	if volumeAs == "subpath" {
+	} else if volumeAs == "subpath" {
 		nfsVersion := "3"
 		if strings.Contains(nfsOptions, "vers=4.0") {
 			nfsVersion = "4.0"
@@ -659,8 +701,9 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 		}
 
 		log.Infof("Delete Successful: Volume %s, Archiving path %s to %s", req.VolumeId, deletePath, archivePath)
+	} else if volumeAs == "sharepath" {
+		log.Infof("Using sharepath mode, the path %s does not need to be deleted.", nfsPath)
 	}
-
 	// remove the pvc process mapping if exist
 	if _, ok := pvcProcessSuccess[req.VolumeId]; ok {
 		delete(pvcProcessSuccess, req.VolumeId)
@@ -675,8 +718,8 @@ func (cs *controllerServer) getNasVolumeOptions(req *csi.CreateVolumeRequest) (*
 
 	if nasVolArgs.VolumeAs, ok = volOptions[VolumeAs]; !ok {
 		nasVolArgs.VolumeAs = "subpath"
-	} else if nasVolArgs.VolumeAs != "filesystem" && nasVolArgs.VolumeAs != "subpath" {
-		return nil, fmt.Errorf("Required parameter [parameter.volumeAs] must be [filesystem] or [subpath]")
+	} else if nasVolArgs.VolumeAs != "filesystem" && nasVolArgs.VolumeAs != "subpath" && nasVolArgs.VolumeAs != "sharepath" {
+		return nil, fmt.Errorf("Required parameter [parameter.volumeAs] must be [filesystem] or [subpath] or [sharepath]")
 	}
 
 	if nasVolArgs.VolumeAs == "filesystem" {
@@ -788,7 +831,7 @@ func (cs *controllerServer) getNasVolumeOptions(req *csi.CreateVolumeRequest) (*
 				nasVolArgs.DeleteVolume = false
 			}
 		}
-	} else if nasVolArgs.VolumeAs == "subpath" {
+	} else if nasVolArgs.VolumeAs == "subpath" || nasVolArgs.VolumeAs == "sharepath" {
 		// server
 		var serverExist bool
 		nasVolArgs.Server, serverExist = volOptions[SERVER]
@@ -798,7 +841,7 @@ func (cs *controllerServer) getNasVolumeOptions(req *csi.CreateVolumeRequest) (*
 			return nil, err
 		}
 		if !serverExist {
-			server, err := v1alpha1.GetContainerNetworkFileSystemServer(cs.crdClient, nasVolArgs.CnfsName)
+			server, err := v1beta1.GetContainerNetworkFileSystemServer(cs.crdClient, nasVolArgs.CnfsName)
 			if err != nil {
 				return nil, err
 			}

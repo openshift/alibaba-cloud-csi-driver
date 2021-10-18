@@ -19,7 +19,7 @@ package nas
 import (
 	"context"
 	"fmt"
-	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/cnfs/v1alpha1"
+	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/cnfs/v1beta1"
 	"io/ioutil"
 	"k8s.io/client-go/dynamic"
 	"net/http"
@@ -345,7 +345,7 @@ func setNasVolumeCapacityWithID(pvObj *v1.PersistentVolume, crdClient dynamic.In
 		nfsServer = value
 	} else {
 		if value, ok := pvObj.Spec.CSI.VolumeAttributes["containerNetworkFileSystem"]; ok {
-			server, err := v1alpha1.GetContainerNetworkFileSystemServer(crdClient, value)
+			server, err := v1beta1.GetContainerNetworkFileSystemServer(crdClient, value)
 			if err != nil {
 				return err
 			}
@@ -534,8 +534,10 @@ func checkLosetupUnmount(mountPoint string) error {
 	imgFile := filepath.Join(nfsPath, LoopImgFile)
 	lockFile := filepath.Join(nfsPath, LoopLockFile)
 	if utils.IsFileExisting(imgFile) {
-		if err := os.Remove(lockFile); err != nil {
-			return fmt.Errorf("checkLosetupUnmount: remove lock file error %v", err)
+		if utils.IsFileExisting(lockFile) {
+			if err := os.Remove(lockFile); err != nil {
+				return fmt.Errorf("checkLosetupUnmount: remove lock file error %v", err)
+			}
 		}
 		if err := utils.Umount(nfsPath); err != nil {
 			return fmt.Errorf("checkLosetupUnmount: umount nfs path error %v", err)
