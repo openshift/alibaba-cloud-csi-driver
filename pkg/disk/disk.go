@@ -75,7 +75,6 @@ type GlobalConfig struct {
 	DiskPartitionEnable   bool
 	ControllerService     bool
 	BdfHealthCheck        bool
-	DiskMultiTenantEnable bool
 }
 
 // define global variable
@@ -162,7 +161,6 @@ func GlobalConfigSet(client *ecs.Client, region, nodeID string) *restclient.Conf
 	isDiskDetachDisable := false
 	isDiskDetachBeforeDelete := true
 	isDiskBdfEnable := false
-	isDiskMultiTenantEnable := false
 
 	// Global Configs Set
 	cfg, err := clientcmd.BuildConfigFromFlags(masterURL, kubeconfig)
@@ -326,13 +324,6 @@ func GlobalConfigSet(client *ecs.Client, region, nodeID string) *restclient.Conf
 	if os.Getenv("BDF_HEALTH_CHECK") == "false" {
 		bdfCheck = false
 	}
-	diskMultiTenantEnable := os.Getenv(DiskMultiTenantEnable)
-	if diskMultiTenantEnable == "true" || diskMultiTenantEnable == "yes" {
-		log.Infof("Multi tenant is Enabled")
-		isDiskMultiTenantEnable = true
-	} else if diskMultiTenantEnable == "false" || diskMultiTenantEnable == "no" {
-		isDiskMultiTenantEnable = false
-	}
 
 	log.Infof("Starting with GlobalConfigVar: region(%s), NodeID(%s), ADControllerEnable(%t), DiskTagEnable(%t), DiskBdfEnable(%t), MetricEnable(%t), RunTimeClass(%s), DetachDisabled(%t), DetachBeforeDelete(%t), ClusterID(%s)", region, nodeID, isADControllerEnable, isDiskTagEnable, isDiskBdfEnable, isDiskMetricEnable, runtimeValue, isDiskDetachDisable, isDiskDetachBeforeDelete, clustID)
 	// Global Config Set
@@ -355,7 +346,6 @@ func GlobalConfigSet(client *ecs.Client, region, nodeID string) *restclient.Conf
 		DiskPartitionEnable:   partition,
 		ControllerService:     controllerServerType,
 		BdfHealthCheck:        bdfCheck,
-		DiskMultiTenantEnable: isDiskMultiTenantEnable,
 	}
 	return cfg
 }

@@ -67,7 +67,7 @@ if [ "$run_oss" = "true" ]; then
 
     ossfsVer="1.80.6.ack.1"
     if [ "$USE_UPDATE_OSSFS" == "" ]; then
-        ossfsVer="1.86.2"
+        ossfsVer="1.86.4"
     fi
 
     ossfsArch="centos7.0"
@@ -96,21 +96,6 @@ if [ "$run_oss" = "true" ]; then
             /nsenter --mount=/proc/1/ns/mnt yum remove -y ossfs
             cp /root/ossfs_${ossfsVer}_${ossfsArch}_x86_64.rpm /host/etc/csi-tool/
             /nsenter --mount=/proc/1/ns/mnt yum localinstall -y /etc/csi-tool/ossfs_${ossfsVer}_${ossfsArch}_x86_64.rpm
-        fi
-    fi
-
-    # install Jindofs
-    if [ ! -f "/host/etc/jindofs-tool/jindofs-fuse" ];then
-        mkdir -p /host/etc/jindofs-tool/
-        cp /jindofs-fuse /host/etc/jindofs-tool/jindofs-fuse
-        echo "install jindofs..."
-    else
-        oldmd5=`md5sum /host/etc/jindofs-tool/jindofs-fuse | awk '{print $1}'`
-        newmd5=`md5sum /jindofs-fuse | awk '{print $1}'`
-        if [ "$oldmd5" != "$newmd5" ]; then
-            rm -rf /host/etc/jindofs-tool/jindofs-fuse
-            cp /jindofs-fuse /host/etc/jindofs-tool/jindofs-fuse
-            echo "upgrade jindofs..."
         fi
     fi
 

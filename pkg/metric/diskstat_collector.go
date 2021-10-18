@@ -13,7 +13,6 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -310,7 +309,6 @@ func isIOHang(stats []string, lastStats []string) bool {
 }
 
 func (p *diskStatCollector) latencyEventAlert(pvName string, pvcName string, pvcNamespace string, stats []string, index int) {
-
 	lastStats, ok := p.lastPvStatsMap.Load(pvName)
 	if p.alertSwtichSet.Contains(latencySwitch) && ok {
 		thisLatency, exceed := isExceedLatencyThreshold(stats, lastStats.([]string), index, index+3, p.milliSecondsLatencyThreshold)
@@ -486,7 +484,7 @@ func getDiskStats() (map[string][]string, error) {
 }
 
 func getGlobalMountPathByPvName(pvName string, info *diskInfo) {
-	info.GlobalMountPath = filepath.Join(utils.KubeletRootDir, "/plugins/kubernetes.io/csi/pv/", pvName, "/globalmount")
+	info.GlobalMountPath = fmt.Sprintf("/var/lib/kubelet/plugins/kubernetes.io/csi/pv/%s/globalmount", pvName)
 }
 
 func getDiskCapacityMetric(pvName string, info *diskInfo, stat []string) ([]string, error) {
