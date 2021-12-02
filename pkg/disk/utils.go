@@ -952,8 +952,8 @@ func getDiskVolumeOptions(req *csi.CreateVolumeRequest) (*diskVolumeArgs, error)
 			diskVolArgs.FsType = "ext4"
 		}
 	}
-	if diskVolArgs.FsType != "ext4" && diskVolArgs.FsType != "ext3" {
-		return nil, fmt.Errorf("illegal required parameter fsType, only support ext3, ext4, the input is: %s", diskVolArgs.FsType)
+	if diskVolArgs.FsType != "ext4" && diskVolArgs.FsType != "ext3" && diskVolArgs.FsType != "xfs" {
+		return nil, fmt.Errorf("illegal required parameter fsType, only support ext3, ext4 and xfs, the input is: %s", diskVolArgs.FsType)
 	}
 
 	// disk Type
@@ -1258,4 +1258,14 @@ func intersect(slice1, slice2 []string) []string {
 		}
 	}
 	return nn
+}
+
+// hasMountOption return boolean value indicating whether the slice contains a mount option
+func hasMountOption(options []string, opt string) bool {
+	for _, o := range options {
+		if o == opt {
+			return true
+		}
+	}
+	return false
 }
