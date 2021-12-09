@@ -100,6 +100,8 @@ const (
 	FileSystemLoseCapacityPercent = "FILE_SYSTEM_LOSE_PERCENT"
 	// NsenterCmd run command on host
 	NsenterCmd = "/nsenter --mount=/proc/1/ns/mnt"
+	// NOUUID is xfs fs mount opts
+	NOUUID = "nouuid"
 )
 
 // QueryResponse response struct for query server
@@ -571,6 +573,7 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	if mnt.FsType != "" {
 		fsType = mnt.FsType
 	}
+	mountOptions := collectMountOptions(fsType, options)
 	if err := ns.mounter.EnsureFolder(targetPath); err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
@@ -584,18 +587,18 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	// do format-mount or mount
 	diskMounter := &k8smount.SafeFormatAndMount{Interface: ns.k8smounter, Exec: utilexec.New()}
 	if len(mkfsOptions) > 0 && (fsType == "ext4" || fsType == "ext3") {
-		if err := formatAndMount(diskMounter, device, targetPath, fsType, mkfsOptions, options); err != nil {
-			log.Errorf("Mountdevice: FormatAndMount fail with mkfsOptions %s, %s, %s, %s, %s with error: %s", device, targetPath, fsType, mkfsOptions, options, err.Error())
+		if err := formatAndMount(diskMounter, device, targetPath, fsType, mkfsOptions, mountOptions); err != nil {
+			log.Errorf("Mountdevice: FormatAndMount fail with mkfsOptions %s, %s, %s, %s, %s with error: %s", device, targetPath, fsType, mkfsOptions, mountOptions, err.Error())
 			return nil, status.Error(codes.Internal, err.Error())
 		}
 	} else {
-		if err := diskMounter.FormatAndMount(device, targetPath, fsType, options); err != nil {
+		if err := diskMounter.FormatAndMount(device, targetPath, fsType, mountOptions); err != nil {
 			log.Errorf("NodeStageVolume: Volume: %s, Device: %s, FormatAndMount error: %s", req.VolumeId, device, err.Error())
 			return nil, status.Error(codes.Internal, err.Error())
 		}
 	}
 
-	log.Infof("NodeStageVolume: Mount Successful: volumeId: %s target %v, device: %s, mkfsOptions: %v, options: %v", req.VolumeId, targetPath, device, mkfsOptions, options)
+	log.Infof("NodeStageVolume: Mount Successful: volumeId: %s target %v, device: %s, mkfsOptions: %v, options: %v", req.VolumeId, targetPath, device, mkfsOptions, mountOptions)
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
@@ -835,6 +838,7 @@ func (ns *nodeServer) mountDeviceToGlobal(capability *csi.VolumeCapability, volu
 	if mnt.FsType != "" {
 		fsType = mnt.FsType
 	}
+	mountOptions := collectMountOptions(fsType, options)
 	if err := ns.mounter.EnsureFolder(sourcePath); err != nil {
 		return status.Error(codes.Internal, err.Error())
 	}
@@ -848,12 +852,12 @@ func (ns *nodeServer) mountDeviceToGlobal(capability *csi.VolumeCapability, volu
 	// do format-mount or mount
 	diskMounter := &k8smount.SafeFormatAndMount{Interface: ns.k8smounter, Exec: utilexec.New()}
 	if len(mkfsOptions) > 0 && (fsType == "ext4" || fsType == "ext3") {
-		if err := formatAndMount(diskMounter, device, sourcePath, fsType, mkfsOptions, options); err != nil {
-			log.Errorf("mountDeviceToGlobal: FormatAndMount fail with mkfsOptions %s, %s, %s, %s, %s with error: %s", device, sourcePath, fsType, mkfsOptions, options, err.Error())
+		if err := formatAndMount(diskMounter, device, sourcePath, fsType, mkfsOptions, mountOptions); err != nil {
+			log.Errorf("mountDeviceToGlobal: FormatAndMount fail with mkfsOptions %s, %s, %s, %s, %s with error: %s", device, sourcePath, fsType, mkfsOptions, mountOptions, err.Error())
 			return status.Error(codes.Internal, err.Error())
 		}
 	} else {
-		if err := diskMounter.FormatAndMount(device, sourcePath, fsType, options); err != nil {
+		if err := diskMounter.FormatAndMount(device, sourcePath, fsType, mountOptions); err != nil {
 			log.Errorf("mountDeviceToGlobal: Device: %s, FormatAndMount error: %s", device, err.Error())
 			return status.Error(codes.Internal, err.Error())
 		}
@@ -889,4 +893,21 @@ func (ns *nodeServer) unmountDuplicateMountPoint(targetPath string) error {
 		log.Warnf("Target Path is illegal format: %s", targetPath)
 	}
 	return nil
+}
+
+// collectMountOptions returns array of mount options
+func collectMountOptions(fsType string, mntFlags []string) (options []string) {
+	for _, opt := range mntFlags {
+		if !hasMountOption(options, opt) {
+			options = append(options, opt)
+		}
+	}
+
+	if fsType == "xfs" {
+		if !hasMountOption(options, NOUUID) {
+			options = append(options, NOUUID)
+		}
+	}
+	return
+
 }
