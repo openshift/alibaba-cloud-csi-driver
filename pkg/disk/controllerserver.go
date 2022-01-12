@@ -554,6 +554,7 @@ func (cs *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateS
 	} else {
 		instantAccessRetentionDays = retentionDays
 	}
+
 	log.Infof("CreateSnapshot:: Starting to create snapshot: %+v", req)
 	if err := cs.Driver.ValidateControllerServiceRequest(csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT); err != nil {
 		return nil, err
@@ -672,6 +673,7 @@ func (cs *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateS
 		SourceVolumeId: sourceVolumeID,
 		CreationTime:   createAt,
 		ReadyToUse:     false,
+		SizeBytes:      gi2Bytes(int64(disks[0].Size)),
 	}
 
 	createdSnapshotMap[req.Name] = csiSnapshot
@@ -944,7 +946,7 @@ func formatCSISnapshot(ecsSnapshot *ecs.Snapshot) (*csi.Snapshot, error) {
 		return nil, status.Errorf(codes.Internal, "failed to parse snapshot creation time: %s", ecsSnapshot.CreationTime)
 	}
 	sizeGb, _ := strconv.ParseInt(ecsSnapshot.SourceDiskSize, 10, 64)
-	sizeBytes := sizeGb * 1024 * 1024 * 1024
+	sizeBytes := gi2Bytes(sizeGb)
 	readyToUse := false
 	if ecsSnapshot.Status == "accomplished" {
 		readyToUse = true
@@ -956,4 +958,8 @@ func formatCSISnapshot(ecsSnapshot *ecs.Snapshot) (*csi.Snapshot, error) {
 		CreationTime:   &timestamp.Timestamp{Seconds: t.Unix()},
 		ReadyToUse:     readyToUse,
 	}, nil
+}
+
+func gi2Bytes(gb int64) int64 {
+	return gb * 1024 * 1024 * 1024
 }
