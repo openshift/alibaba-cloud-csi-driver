@@ -162,19 +162,19 @@ type RoleAuth struct {
 	Code            string
 }
 
-func newEcsClient(accessKeyID, accessKeySecret, accessToken string) (ecsClient *ecs.Client) {
-	var err error
+func newEcsClient(ac utils.AccessControl) (ecsClient *ecs.Client) {
 	regionID := GetRegionID()
-	if accessToken == "" {
-		ecsClient, err = ecs.NewClientWithAccessKey(regionID, accessKeyID, accessKeySecret)
-		if err != nil {
-			return nil
-		}
-	} else {
-		ecsClient, err = ecs.NewClientWithStsToken(regionID, accessKeyID, accessKeySecret, accessToken)
-		if err != nil {
-			return nil
-		}
+	var err error
+	switch ac.UseMode {
+	case utils.AccessKey:
+		ecsClient, err = ecs.NewClientWithAccessKey(regionID, ac.AccessKeyID, ac.AccessKeySecret)
+	case utils.Credential:
+		ecsClient, err = ecs.NewClientWithOptions(regionID, ac.Config, ac.Credential)
+	default:
+		ecsClient, err = ecs.NewClientWithStsToken(regionID, ac.AccessKeyID, ac.AccessKeySecret, ac.StsToken)
+	}
+	if err != nil {
+		return nil
 	}
 
 	if os.Getenv("INTERNAL_MODE") == "true" {
@@ -188,9 +188,9 @@ func newEcsClient(accessKeyID, accessKeySecret, accessToken string) (ecsClient *
 }
 
 func updateEcsClent(client *ecs.Client) *ecs.Client {
-	accessKeyID, accessSecret, accessToken := utils.GetDefaultAK()
-	if accessToken != "" {
-		client = newEcsClient(accessKeyID, accessSecret, accessToken)
+	ac := utils.GetAccessControl()
+	if ac.UseMode == utils.EcsRAMRole || ac.UseMode == utils.ManagedToken {
+		client = newEcsClient(ac)
 	}
 	if client.Client.GetConfig() != nil {
 		client.Client.GetConfig().UserAgent = KubernetesAlicloudIdentity
