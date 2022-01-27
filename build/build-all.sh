@@ -14,7 +14,7 @@ rm -rf build/ack/csiplugin-connector.go build/ack/csiplugin-connector-svc build/
 cp build/oss/csiplugin-connector.go build/ack/csiplugin-connector.go
 cp build/oss/csiplugin-connector.service build/ack/csiplugin-connector.service
 cp build/oss/nsenter build/ack/nsenter
-cp build/oss/jindofs-fuse build/ack/jindofs-fuse
+#cp build/oss/jindofs-fuse build/ack/jindofs-fuse
 
 export GOARCH="amd64"
 export GOOS="linux"
