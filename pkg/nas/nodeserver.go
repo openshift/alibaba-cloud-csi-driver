@@ -20,6 +20,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/ioutil"
+	"net"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-csi/drivers/pkg/csi-common"
 	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/cnfs/v1beta1"
@@ -30,12 +39,6 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
-	"net"
-	"os"
-	"path/filepath"
-	"strings"
-	"sync"
-	"time"
 )
 
 type nodeServer struct {
@@ -143,12 +146,12 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	}
 
 	if len(opt.Server) == 0 {
-		server, err := v1beta1.GetContainerNetworkFileSystemServer(ns.crdClient, cnfsName)
+		cnfs, err := v1beta1.GetCnfsObject(ns.crdClient, cnfsName)
 		if err != nil {
 			return nil, err
 		}
 
-		opt.Server = server
+		opt.Server = cnfs.Status.FsAttributes.Server
 	}
 
 	if opt.LoopLock != "false" {
@@ -328,7 +331,8 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 		return &csi.NodeUnpublishVolumeResponse{}, nil
 	}
 	mountPoint := req.TargetPath
-	if !utils.IsMounted(mountPoint) {
+	isNotMounted, err := utils.IsLikelyNotMountPoint(mountPoint)
+	if (isNotMounted && err == nil) || os.IsNotExist(err) {
 		log.Infof("Umount Nas: mountpoint not mounted, skipping: %s", mountPoint)
 		if GlobalConfigVar.LosetupEnable {
 			if err := checkLosetupUnmount(mountPoint); err != nil {
@@ -341,6 +345,7 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 
 	umntCmd := fmt.Sprintf("umount %s", mountPoint)
 	if _, err := utils.Run(umntCmd); err != nil {
+		log.Errorf("Nas, Umount nfs(%s) Fail: %s", mountPoint, err.Error())
 		return nil, errors.New("Nas, Umount nfs Fail: " + err.Error())
 	}
 
@@ -397,6 +402,10 @@ func (ns *nodeServer) LosetupExpandVolume(req *csi.NodeExpandVolumeRequest) erro
 		volSizeBytes := int64(req.GetCapacityRange().GetRequiredBytes())
 		// loop block size is 4K
 		blockNum := volSizeBytes / (4 * 1024)
+		// Check parameter validate
+		if !utils.CheckParameterValidate([]string{imgFile, strconv.FormatInt(blockNum, 10)}) {
+			return fmt.Errorf("inputs illegal: %s %s ", imgFile, strconv.FormatInt(blockNum, 10))
+		}
 		imgCmd := fmt.Sprintf("dd if=/dev/zero of=%s bs=4k seek=%d count=0", imgFile, blockNum)
 		_, err := utils.Run(imgCmd)
 		if err != nil {
@@ -410,6 +419,10 @@ func (ns *nodeServer) LosetupExpandVolume(req *csi.NodeExpandVolumeRequest) erro
 			return fmt.Errorf("NodeExpandVolume: search losetup device error, %v", err)
 		}
 		loopDev := strings.TrimSpace(out)
+		// Check parameter validate
+		if !utils.CheckParameterValidate([]string{loopDev}) {
+			return fmt.Errorf("inputs illegal: %s ", loopDev)
+		}
 		loopResize := fmt.Sprintf("%s losetup -c %s", NsenterCmd, loopDev)
 		_, err = utils.Run(loopResize)
 		if err != nil {
@@ -417,15 +430,22 @@ func (ns *nodeServer) LosetupExpandVolume(req *csi.NodeExpandVolumeRequest) erro
 			return fmt.Errorf("NodeExpandVolume: resize device file error, %v", err)
 		}
 
-		chkCmd := fmt.Sprintf("%s fsck -a %s", NsenterCmd, imgFile)
-		_, err = utils.Run(chkCmd)
-		if err != nil {
-			return fmt.Errorf("Check losetup image error %s", err.Error())
-		}
+		// chkCmd := fmt.Sprintf("%s fsck -a %s", NsenterCmd, imgFile)
+		// _, err = utils.Run(chkCmd)
+		// if err != nil {
+		// 	return fmt.Errorf("Check losetup image error %s", err.Error())
+		// }
 		resizeFs := fmt.Sprintf("%s resize2fs %s", NsenterCmd, loopDev)
 		_, err = utils.Run(resizeFs)
 		if err != nil {
 			log.Errorf("NodeExpandVolume: resize filesystem error %v", err)
+			failedFile := filepath.Join(nfsPath, Resize2fsFailedFilename)
+			if !utils.IsFileExisting(failedFile) {
+				// path/to/whatever does not exist
+				if werr := ioutil.WriteFile(failedFile, ([]byte)(""), 0644); werr != nil {
+					return fmt.Errorf("NodeExpandVolume: write file err %s, resizefs err: %s", werr, err)
+				}
+			}
 			return fmt.Errorf("NodeExpandVolume: resize filesystem error, %v", err)
 		}
 		log.Infof("NodeExpandVolume, losetup volume expand successful %s to %d B", req.VolumeId, volSizeBytes)

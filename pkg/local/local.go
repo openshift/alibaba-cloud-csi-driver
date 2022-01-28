@@ -18,15 +18,19 @@ package local
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-csi/drivers/pkg/csi-common"
 	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/local/types"
+	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/utils"
 	log "github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
-	"os"
-	"strings"
 )
 
 // Local the Local struct
@@ -48,12 +52,101 @@ const (
 	csiVersion        = "1.0.0"
 )
 
+const (
+	localSecretName      = "csi-local-plugin-cert"
+	localSecretNamespace = "kube-system"
+	caCertFileName       = "ca_cert.pem"
+	serverCertFileName   = "server_cert.pem"
+	serverKeyFileName    = "server_key.pem"
+	clientCertFileName   = "client_cert.pem"
+	clientKeyFileName    = "client_key.pem"
+)
+
 // PmemSupportType ...
 var PmemSupportType = []string{types.PmemLVMType, types.PmemDirectType, types.PmemKmemType, types.PmemQuotaPathType}
 
 // Init checks for the persistent volume file and loads all found volumes
 // into a memory structure
 func initDriver() {
+}
+
+func writeClientCert(caCert []byte, clientCert []byte, clientKey []byte) (string, string, string) {
+	caCertPath := filepath.Join(utils.MountPathWithTLS, "/local/grpc")
+	utils.CreateDest(caCertPath)
+	caCertFile := caCertPath + "/" + caCertFileName
+	clientCertFile := caCertPath + "/" + clientCertFileName
+	clientKeyFile := caCertPath + "/" + clientKeyFileName
+	err := utils.WriteAndSyncFile(caCertFile, caCert, 0644)
+	if err != nil {
+		log.Fatalf("WriteFile caCertFile is failed, caCertFile:%s, err:%s", caCertFile, err)
+	}
+	err = utils.WriteAndSyncFile(clientCertFile, clientCert, 0644)
+	if err != nil {
+		log.Fatalf("WriteFile clientCertFile is failed, clientCertFile:%s, err:%s", clientCertFile, err)
+	}
+	err = utils.WriteAndSyncFile(clientKeyFile, clientKey, 0644)
+	if err != nil {
+		log.Fatalf("WriteFile clientKeyFile is failed, clientKeyFile:%s, err:%s", clientKeyFile, err)
+	}
+	return caCertFile, clientCertFile, clientKeyFile
+}
+
+func createSecretWithTLS() (string, string, string) {
+	secret, err := getSecret(localSecretNamespace, localSecretName)
+	if err == nil {
+		caCert, ok := secret.Data[caCertFileName]
+		if !ok {
+			log.Fatalf("caCert is not exist.")
+		}
+		clientCert, ok := secret.Data[clientCertFileName]
+		if !ok {
+			log.Fatalf("clientCert is not exist.")
+		}
+		clientKey, ok := secret.Data[clientKeyFileName]
+		if !ok {
+			log.Fatalf("clientKey is not exist.")
+		}
+		return writeClientCert(caCert, clientCert, clientKey)
+	}
+
+	begin := time.Now().Add(-time.Hour)
+	end := time.Now().Add(time.Hour * 24 * 365 * 100)
+	ca, err := utils.CreateCACert(utils.CertOption{
+		CAName:          "csi-local-plugin-ca",
+		CAOrganizations: []string{"csi-local-plugin"},
+		DNSNames:        []string{"csi-local-plugin"},
+		CommonName:      "csi-local-plugin",
+	}, begin, end)
+	if err != nil {
+		log.Fatalf("CreateCACert is failed, err:%s", err)
+	}
+	// server cert
+	serverCert, serverKey, err := utils.CreateCertPEM(utils.CertOption{
+		DNSNames:   []string{"csi-local-plugin-server"},
+		CommonName: "csi-local-plugin-server",
+	}, ca, begin, end, false)
+	if err != nil {
+		log.Fatalf("CreatesServerCertPEM is failed, err:%s", err)
+	}
+
+	// client cert
+	clientCert, clientKey, err := utils.CreateCertPEM(utils.CertOption{
+		CommonName: "csi-local-plugin-client",
+	}, ca, begin, end, true)
+	if err != nil {
+		log.Fatalf("CreateClientCertPEM is failed, err:%s", err)
+	}
+	secret = prepareSecret(localSecretNamespace, localSecretName, map[string]string{}, map[string]string{})
+	addToSecretFromData(secret, caCertFileName, ca.CertPEM)
+	addToSecretFromData(secret, serverCertFileName, serverCert)
+	addToSecretFromData(secret, serverKeyFileName, serverKey)
+	addToSecretFromData(secret, clientCertFileName, clientCert)
+	addToSecretFromData(secret, clientKeyFileName, clientKey)
+	err = createSecret(secret)
+	if err != nil {
+		log.Fatalf("CreateSecret is failed, err:+%v", err)
+	}
+	return writeClientCert(ca.CertPEM, clientCert, clientKey)
 }
 
 // NewDriver create the identity/node/controller server and disk driver
@@ -63,7 +156,7 @@ func NewDriver(nodeID, endpoint string) *Local {
 	tmplvm.endpoint = endpoint
 
 	if nodeID == "" {
-		nodeID = GetMetaData(InstanceID)
+		nodeID = utils.RetryGetMetaData(InstanceID)
 		log.Infof("Use node id : %s", nodeID)
 	}
 
@@ -88,8 +181,14 @@ func NewDriver(nodeID, endpoint string) *Local {
 
 	// Create GRPC servers
 	tmplvm.idServer = newIdentityServer(tmplvm.driver)
-	tmplvm.nodeServer = NewNodeServer(tmplvm.driver, driverName, nodeID)
-	tmplvm.controllerServer = newControllerServer(tmplvm.driver)
+
+	if os.Getenv(utils.ServiceType) == utils.ProvisionerService {
+		//Create secret with TLS by Provisioner
+		caCertFile, clientCertFile, clientKeyFile := createSecretWithTLS()
+		tmplvm.controllerServer = newControllerServer(tmplvm.driver, caCertFile, clientCertFile, clientKeyFile)
+	} else {
+		tmplvm.nodeServer = NewNodeServer(tmplvm.driver, driverName, nodeID)
+	}
 
 	return tmplvm
 }
@@ -141,15 +240,30 @@ func GlobalConfigSet(region, nodeID, driverName string) {
 		grpcProvision = false
 	}
 
+	hostNameAsTop := false
+	hostNameEnv := os.Getenv("LOCAL_HOSTNAME_AS_TOPO")
+	if strings.ToLower(hostNameEnv) == "true" {
+		hostNameAsTop = true
+	}
+
+	topoKeyDefine := TopologyNodeKey
+	topoKeyStr := os.Getenv("LOCAL_TOPO_KEY_DEFINED")
+	if topoKeyStr != "" {
+		log.Infof("Lcoal: use special topoloy key with LOCAL_TOPO_KEY_DEFINED: %s", topoKeyStr)
+		topoKeyDefine = topoKeyStr
+	}
+
 	// Global Config Set
 	types.GlobalConfigVar = types.GlobalConfig{
-		Region:        region,
-		NodeID:        nodeID,
-		Scheduler:     driverName,
-		PmemEnable:    pmemEnable,
-		PmemType:      pmeType,
-		GrpcProvision: grpcProvision,
-		KubeClient:    kubeClient,
+		Region:         region,
+		NodeID:         nodeID,
+		Scheduler:      driverName,
+		PmemEnable:     pmemEnable,
+		PmemType:       pmeType,
+		GrpcProvision:  grpcProvision,
+		KubeClient:     kubeClient,
+		HostNameAsTopo: hostNameAsTop,
+		TopoKeyDefine:  topoKeyDefine,
 	}
 	log.Infof("Local Plugin Global Config is: %v", types.GlobalConfigVar)
 }

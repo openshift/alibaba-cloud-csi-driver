@@ -50,12 +50,12 @@ func getPvcByPvNameByNas(clientSet *kubernetes.Clientset, cnfsClient dynamic.Int
 				return pv.Spec.ClaimRef.Namespace, pv.Spec.ClaimRef.Name, val, nil
 			}
 		} else if value, ok := pv.Spec.CSI.VolumeAttributes[containerNetworkFileSystem]; ok {
-			server, err := v1beta1.GetContainerNetworkFileSystemServer(cnfsClient, value)
+			cnfs, err := v1beta1.GetCnfsObject(cnfsClient, value)
 			if err != nil {
 				log.Errorf("Get cnfs %s server is failed, err:%s", value, err)
 				return "", "", "", err
 			}
-			return pv.Spec.ClaimRef.Namespace, pv.Spec.ClaimRef.Name, server, nil
+			return pv.Spec.ClaimRef.Namespace, pv.Spec.ClaimRef.Name, cnfs.Status.FsAttributes.Server, nil
 		}
 	}
 	return "", "", "", errors.New("pvName:" + pv.Name + " status is not bound.")
@@ -136,7 +136,7 @@ func isVFNode() bool {
 		// 0000:4b:00.0 SCSI storage controller: Device 1ded:1001
 		matched := findLines(output, "storage controller")
 		if len(matched) == 0 {
-			log.Fatal("[IsVFNode] not found storage controller")
+			log.Errorf("[IsVFNode] not found storage controller")
 		}
 		for _, line := range matched {
 			// 1ded: is alibaba cloud
@@ -196,7 +196,7 @@ func getDeviceByVolumeID(pvName, volumeID string) (device string, err error) {
 	}
 
 	if device, err = getDeviceBySymlink(volumeID); err != nil {
-		mountPath := filepath.Join("/var/lib/kubelet/plugins/kubernetes.io/csi/volumeDevices/staging", pvName, volumeID)
+		mountPath := filepath.Join(utils.KubeletRootDir, "/plugins/kubernetes.io/csi/volumeDevices/staging", pvName, volumeID)
 		cmd := fmt.Sprintf("findmnt -o SOURCE --noheadings %s", mountPath)
 		out, err := utils.Run(cmd)
 		if err != nil {

@@ -25,7 +25,8 @@ import (
 
 	"github.com/aliyun/alibaba-cloud-sdk-go/services/ecs"
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	csicommon "github.com/kubernetes-csi/drivers/pkg/csi-common"
+	"github.com/kubernetes-csi/drivers/pkg/csi-common"
+	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/utils"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc/codes"
@@ -35,8 +36,6 @@ import (
 	"k8s.io/kubernetes/pkg/util/resizefs"
 	utilexec "k8s.io/utils/exec"
 	k8smount "k8s.io/utils/mount"
-
-	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/utils"
 )
 
 type nodeServer struct {
@@ -86,6 +85,8 @@ const (
 	DiskAttachedValue = "true"
 	// VolumeDir volume dir
 	VolumeDir = "/host/etc/kubernetes/volumes/disk/"
+	// RundSocketDir dir
+	RundSocketDir = "/host/etc/kubernetes/volumes/rund/"
 	// VolumeDirRemove volume dir remove
 	VolumeDirRemove = "/host/etc/kubernetes/volumes/disk/remove"
 	// MixRunTimeMode support both runc and runv
@@ -94,14 +95,27 @@ const (
 	RunvRunTimeMode = "runv"
 	// InputOutputErr tag
 	InputOutputErr = "input/output error"
-	// BLOCKVOLUMEPREFIX block volume mount prefix
-	BLOCKVOLUMEPREFIX = "/var/lib/kubelet/plugins/kubernetes.io/csi/volumeDevices/publish"
 	// FileSystemLoseCapacityPercent is the env of container
 	FileSystemLoseCapacityPercent = "FILE_SYSTEM_LOSE_PERCENT"
 	// NsenterCmd run command on host
 	NsenterCmd = "/nsenter --mount=/proc/1/ns/mnt"
+	// DiskMultiTenantEnable Enable disk multi-tenant mode
+	DiskMultiTenantEnable = "DISK_MULTI_TENANT_ENABLE"
+	// TenantUserUID tag
+	TenantUserUID = "alibabacloud.com/user-uid"
+	// CreateDiskARN ARN parameter of the CreateDisk interface
+	CreateDiskARN = "alibabacloud.com/createdisk-arn"
+	// SocketPath is path of connector sock
+	SocketPath = "/host/etc/csi-tool/diskconnector.sock"
+	// MaxVolumesPerNode define max ebs one node
+	MaxVolumesPerNode = 15
 	// NOUUID is xfs fs mount opts
 	NOUUID = "nouuid"
+)
+
+var (
+	// BLOCKVOLUMEPREFIX block volume mount prefix
+	BLOCKVOLUMEPREFIX = filepath.Join(utils.KubeletRootDir, "/plugins/kubernetes.io/csi/volumeDevices/publish")
 )
 
 // QueryResponse response struct for query server
@@ -115,7 +129,7 @@ type QueryResponse struct {
 
 // NewNodeServer creates node server
 func NewNodeServer(d *csicommon.CSIDriver, c *ecs.Client) csi.NodeServer {
-	var maxVolumesNum int64 = 15
+	var maxVolumesNum int64 = MaxVolumesPerNode
 	volumeNum := os.Getenv("MAX_VOLUMES_PERNODE")
 	if "" != volumeNum {
 		num, err := strconv.ParseInt(volumeNum, 10, 64)
@@ -130,14 +144,14 @@ func NewNodeServer(d *csicommon.CSIDriver, c *ecs.Client) csi.NodeServer {
 			}
 		}
 	} else {
-		log.Infof("NewNodeServer: MAX_VOLUMES_PERNODE is set to(default): %d", maxVolumesNum)
+		maxVolumesNum = getVolumeCount()
 	}
 
 	zoneID := ""
 	nodeID := GlobalConfigVar.NodeID
 	internalMode := os.Getenv("INTERNAL_MODE")
 	if internalMode == "true" {
-		zoneID = getZoneID(c, nodeID)
+		zoneID, nodeID = getZoneID(c, nodeID)
 	} else {
 		doc, err := getInstanceDoc()
 		if err != nil {
@@ -159,6 +173,7 @@ func NewNodeServer(d *csicommon.CSIDriver, c *ecs.Client) csi.NodeServer {
 	// Create Directory
 	os.MkdirAll(VolumeDir, os.FileMode(0755))
 	os.MkdirAll(VolumeDirRemove, os.FileMode(0755))
+	os.MkdirAll(RundSocketDir, os.FileMode(0755))
 
 	if IsVFNode() {
 		log.Infof("Currently node is VF model")
@@ -223,6 +238,13 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	sourcePath := req.StagingTargetPath
 	// running in runc/runv mode
 	if GlobalConfigVar.RunTimeClass == MixRunTimeMode {
+		// if target path mounted already, return
+		if utils.IsMounted(req.TargetPath) {
+			log.Infof("NodePublishVolume: TargetPath(%s) is mounted, not need mount again", req.TargetPath)
+			return &csi.NodePublishVolumeResponse{}, nil
+		}
+
+		// check pod runtime
 		if runtime, err := utils.GetPodRunTime(req, ns.clientSet); err != nil {
 			return nil, status.Errorf(codes.Internal, "NodePublishVolume: cannot get pod runtime: %v", err)
 		} else if runtime == RunvRunTimeMode {
@@ -475,6 +497,13 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	if !notmounted {
+		// if target path is mounted tmpfs, return
+		if utils.IsDirTmpfs(req.StagingTargetPath) {
+			log.Infof("NodeStageVolume: TargetPath(%s) is mounted as tmpfs, not need mount again", req.StagingTargetPath)
+			return &csi.NodeStageVolumeResponse{}, nil
+		}
+
+		// check device avaliable
 		deviceName := GetDeviceByMntPoint(targetPath)
 		if err := checkDeviceAvailable(deviceName, req.VolumeId, targetPath); err != nil {
 			log.Errorf("NodeStageVolume: mountPath is mounted %s, but check device available error: %s", targetPath, err.Error())
@@ -488,7 +517,7 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	isSharedDisk := false
 	if value, ok := req.VolumeContext[SharedEnable]; ok {
 		value = strings.ToLower(value)
-		if value == "enable" || value == "true" || value == "yes" {
+		if checkOption(value) {
 			isSharedDisk = true
 		}
 	}
@@ -514,7 +543,7 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 			return nil, status.Error(codes.Aborted, "NodeStageVolume: ADController Enabled, but device can't be found:"+req.VolumeId+err.Error())
 		}
 	} else {
-		device, err = attachDisk(req.GetVolumeId(), ns.nodeID, isSharedDisk)
+		device, err = attachDisk(req.VolumeContext[TenantUserUID], req.GetVolumeId(), ns.nodeID, isSharedDisk)
 		if err != nil {
 			fullErrorMessage := utils.FindSuggestionByErrorMessage(err.Error(), utils.DiskAttachDetach)
 			log.Errorf("NodeStageVolume: Attach volume: %s with error: %s", req.VolumeId, fullErrorMessage)
@@ -687,8 +716,11 @@ func (ns *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 			log.Infof("NodeUnstageVolume: ADController is Disable, Detach Flag Set to false, PV %s", req.VolumeId)
 			return &csi.NodeUnstageVolumeResponse{}, nil
 		}
-
-		err := detachDisk(req.VolumeId, ns.nodeID)
+		ecsClient, err := getEcsClientByID(req.VolumeId, "")
+		if err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+		err = detachDisk(ecsClient, req.VolumeId, ns.nodeID)
 		if err != nil {
 			log.Errorf("NodeUnstageVolume: VolumeId: %s, Detach failed with error %v", req.VolumeId, err.Error())
 			return nil, err
@@ -730,6 +762,16 @@ func (ns *nodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 	if strings.Contains(volumePath, BLOCKVOLUMEPREFIX) {
 		log.Infof("NodeExpandVolume:: Block Volume not Expand FS, volumeId: %s, volumePath: %s", diskID, volumePath)
 		return &csi.NodeExpandVolumeResponse{}, nil
+	}
+
+	// volume resize in rund type will transfer to guest os
+	isRund, err := checkRundVolumeExpand(req)
+	if isRund && err == nil {
+		log.Infof("NodeExpandVolume:: Rund Volume ExpandFS Successful, volumeId: %s, volumePath: %s", diskID, volumePath)
+		return &csi.NodeExpandVolumeResponse{}, nil
+	} else if isRund && err != nil {
+		log.Errorf("NodeExpandVolume:: Rund Volume ExpandFS error(%s), volumeId: %s, volumePath: %s", err.Error(), diskID, volumePath)
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
 	devicePath := GetVolumeDeviceName(diskID)

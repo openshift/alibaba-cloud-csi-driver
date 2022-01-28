@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -35,8 +36,15 @@ import (
 	"unicode"
 
 	aliyunep "github.com/aliyun/alibaba-cloud-sdk-go/sdk/endpoints"
+	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/requests"
 	"github.com/aliyun/alibaba-cloud-sdk-go/services/ecs"
+	"github.com/aliyun/alibaba-cloud-sdk-go/services/sts"
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/containerd/ttrpc"
+	"github.com/golang/protobuf/ptypes/timestamp"
+	proto "github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/disk/proto"
+	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/utils"
+	perrors "github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -46,8 +54,6 @@ import (
 	"k8s.io/kubernetes/pkg/volume/util/fs"
 	utilexec "k8s.io/utils/exec"
 	k8smount "k8s.io/utils/mount"
-
-	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/utils"
 )
 
 const (
@@ -127,6 +133,12 @@ const (
 	describeResourceType = "DataDisk"
 	// NodeSchedueTag in annotations
 	NodeSchedueTag = "volume.kubernetes.io/selected-node"
+	// RetryMaxTimes ...
+	RetryMaxTimes = 5
+	// RemoteSnapshotLabelKey ...
+	RemoteSnapshotLabelKey = "csi.alibabacloud.com/snapshot.targetregion"
+	// SnapshotVolumeKey ...
+	SnapshotVolumeKey = "csi.alibabacloud.com/snapshot.volumeid"
 )
 
 var (
@@ -179,6 +191,9 @@ func newEcsClient(ac utils.AccessControl) (ecsClient *ecs.Client) {
 
 	if os.Getenv("INTERNAL_MODE") == "true" {
 		ecsClient.Network = "openapi-share"
+		if ep := os.Getenv("ECS_ENDPOINT"); ep != "" {
+			aliyunep.AddEndpointMapping(regionID, "Ecs", ep)
+		}
 	} else {
 		// Set Unitized Endpoint for hangzhou region
 		SetEcsEndPoint(regionID)
@@ -187,7 +202,7 @@ func newEcsClient(ac utils.AccessControl) (ecsClient *ecs.Client) {
 	return
 }
 
-func updateEcsClent(client *ecs.Client) *ecs.Client {
+func updateEcsClient(client *ecs.Client) *ecs.Client {
 	ac := utils.GetAccessControl()
 	if ac.UseMode == utils.EcsRAMRole || ac.UseMode == utils.ManagedToken {
 		client = newEcsClient(ac)
@@ -619,6 +634,32 @@ func GetDiskFormat(disk string) (string, string, error) {
 	return fstype, "", nil
 }
 
+// Get NVME device name by diskID;
+// /dev/nvme0n1 0: means device index, 1: means namespace for nvme device;
+// udevadm info --query=all --name=/dev/nvme0n1 | grep ID_SERIAL_SHORT | awk -F= '{print $2}'
+// bp1bcfmvsobfauvxb3ow
+func getNvmeDeviceByVolumeID(volumeID string) (device string, err error) {
+	serialNumber := strings.TrimPrefix(volumeID, "d-")
+	files, _ := ioutil.ReadDir("/dev/")
+	for _, f := range files {
+		if strings.HasPrefix(f.Name(), "nvme") && !strings.Contains(f.Name(), "p") {
+			cmd := fmt.Sprintf("%s udevadm info --query=all --name=/dev/%s | grep ID_SERIAL_SHORT | awk -F= '{print $2}'", NsenterCmd, f.Name())
+			snumber, err := utils.Run(cmd)
+			if err != nil {
+				log.Warnf("GetNvmeDeviceByVolumeID: Get device with command %s and got error: %s", cmd, err.Error())
+				continue
+			}
+			snumber = strings.TrimSpace(snumber)
+			if serialNumber == strings.TrimSpace(snumber) {
+				device = filepath.Join("/dev/", f.Name())
+				log.Infof("GetNvmeDeviceByVolumeID: Get nvme device %s with volumeID %s", device, volumeID)
+				return device, nil
+			}
+		}
+	}
+	return "", nil
+}
+
 // GetDeviceByVolumeID First try to find the device by serial
 // If cannot find the device using the serial number, get device by volumeID, link file should be like:
 // /dev/disk/by-id/virtio-wz9cu3ctp6aj1iagco4h -> ../../vdc
@@ -634,6 +675,12 @@ func GetDeviceByVolumeID(volumeID string) (device string, err error) {
 			log.Infof("GetDevice: Use the serial to find device, got %s, volumeID: %s", device, volumeID)
 			return device, nil
 		}
+	}
+
+	// Get NVME device name
+	device, err = getNvmeDeviceByVolumeID(volumeID)
+	if err == nil && device != "" {
+		return device, nil
 	}
 
 	byIDPath := "/dev/disk/by-id/"
@@ -989,6 +1036,12 @@ func getDiskVolumeOptions(req *csi.CreateVolumeRequest) (*diskVolumeArgs, error)
 		}
 	}
 
+	// MultiAttach
+	diskVolArgs.MultiAttach, ok = volOptions["multiAttach"]
+	if !ok {
+		diskVolArgs.DiskTags = "Disabled"
+	}
+
 	// DiskTags
 	diskVolArgs.DiskTags, ok = volOptions["diskTags"]
 	if !ok {
@@ -999,6 +1052,12 @@ func getDiskVolumeOptions(req *csi.CreateVolumeRequest) (*diskVolumeArgs, error)
 	diskVolArgs.KMSKeyID, ok = volOptions["kmsKeyId"]
 	if !ok {
 		diskVolArgs.KMSKeyID = ""
+	}
+
+	if arnStr, ok := volOptions[CreateDiskARN]; ok {
+		if err := json.Unmarshal([]byte(arnStr), &diskVolArgs.ARN); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal arn, string: %s, err: %v", arnStr, err)
+		}
 	}
 
 	// resourceGroupId
@@ -1074,7 +1133,7 @@ func checkDeviceAvailable(devicePath, volumeID, targetPath string) error {
 		return status.Error(codes.Internal, msg)
 	}
 
-	checkCmd := fmt.Sprintf("mount | grep \"%s on /var/lib/kubelet type\" | wc -l", devicePath)
+	checkCmd := fmt.Sprintf("mount | grep \"%s on %s type\" | wc -l", devicePath, utils.KubeletRootDir)
 	if out, err := utils.Run(checkCmd); err != nil {
 		msg := fmt.Sprintf("devicePath(%s) is used to kubelet", devicePath)
 		return status.Error(codes.Internal, msg)
@@ -1154,20 +1213,24 @@ func UpdateNode(nodeID string, client *kubernetes.Clientset, c *ecs.Client) {
 	ctx := context.Background()
 	nodeName := os.Getenv(kubeNodeName)
 	nodeInfo, err := client.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
-	instanceType := nodeInfo.Labels[instanceTypeLabel]
-	zoneID := nodeInfo.Labels[zoneIDLabel]
 	if err != nil {
 		log.Errorf("UpdateNode:: get node info error : %s", err.Error())
 		return
 	}
+	instanceType := nodeInfo.Labels[instanceTypeLabel]
+	zoneID := nodeInfo.Labels[zoneIDLabel]
 	request := ecs.CreateDescribeAvailableResourceRequest()
 	request.InstanceType = instanceType
 	request.DestinationResource = describeResourceType
 	request.ZoneId = zoneID
-	response, err := c.DescribeAvailableResource(request)
-	if err != nil {
-		log.Errorf("UpdateNode:: describe available resource with nodeID: %s", instanceType)
-		return
+	var response *ecs.DescribeAvailableResourceResponse
+	for n := 1; n < RetryMaxTimes; n++ {
+		response, err = c.DescribeAvailableResource(request)
+		if err != nil {
+			log.Errorf("UpdateNode:: describe available resource with nodeID: %s", instanceType)
+			continue
+		}
+		break
 	}
 	availableZones := response.AvailableZones.AvailableZone
 	if len(availableZones) == 1 {
@@ -1193,17 +1256,25 @@ func UpdateNode(nodeID string, client *kubernetes.Clientset, c *ecs.Client) {
 		return
 	}
 	needUpdate := false
-	for n := 1; n < 5; n++ {
-		for _, storageLabel := range instanceStorageLabels {
-			if _, ok := nodeInfo.Labels[storageLabel]; ok {
-				continue
-			} else {
-				needUpdate = true
-				nodeInfo.Labels[storageLabel] = "available"
-			}
+	needUpdateLabels := []string{}
+	for _, storageLabel := range instanceStorageLabels {
+		if _, ok := nodeInfo.Labels[storageLabel]; ok {
+			continue
+		} else {
+			needUpdate = true
+			needUpdateLabels = append(needUpdateLabels, storageLabel)
 		}
+	}
+	for n := 1; n < RetryMaxTimes; n++ {
 		if needUpdate {
-			_, err = client.CoreV1().Nodes().Update(ctx, nodeInfo, metav1.UpdateOptions{})
+			newNode, err := client.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
+			if err != nil {
+				continue
+			}
+			for _, updatedLabel := range needUpdateLabels {
+				newNode.Labels[updatedLabel] = "available"
+			}
+			_, err = client.CoreV1().Nodes().Update(ctx, newNode, metav1.UpdateOptions{})
 			if err != nil {
 				log.Errorf("UpdateNode:: update node error: %s", err.Error())
 				continue
@@ -1216,7 +1287,7 @@ func UpdateNode(nodeID string, client *kubernetes.Clientset, c *ecs.Client) {
 }
 
 // getZoneID ...
-func getZoneID(c *ecs.Client, instanceID string) string {
+func getZoneID(c *ecs.Client, instanceID string) (string, string) {
 
 	node, err := GlobalConfigVar.ClientSet.CoreV1().Nodes().Get(context.Background(), instanceID, metav1.GetOptions{})
 	if err != nil {
@@ -1234,7 +1305,11 @@ func getZoneID(c *ecs.Client, instanceID string) string {
 	request.RegionId = GlobalConfigVar.Region
 	request.InstanceIds = "[\"" + ecsID + "\"]"
 
-	request.Domain = fmt.Sprintf("ecs-openapi-share.%s.aliyuncs.com", GlobalConfigVar.Region)
+	if endpoint := os.Getenv("ECS_ENDPOINT"); endpoint != "" {
+		request.Domain = endpoint
+	} else {
+		request.Domain = fmt.Sprintf("ecs-openapi-share.%s.aliyuncs.com", GlobalConfigVar.Region)
+	}
 	instanceResponse, err := c.DescribeInstances(request)
 	if err != nil {
 		log.Fatalf("getZoneID:: describe instance id error: %s ecsID: %s", err.Error(), ecsID)
@@ -1242,7 +1317,7 @@ func getZoneID(c *ecs.Client, instanceID string) string {
 	if len(instanceResponse.Instances.Instance) != 1 {
 		log.Fatalf("getZoneID:: describe instance returns error instance count: %v, ecsID: %v", len(instanceResponse.Instances.Instance), ecsID)
 	}
-	return instanceResponse.Instances.Instance[0].ZoneId
+	return instanceResponse.Instances.Instance[0].ZoneId, ecsID
 }
 
 func intersect(slice1, slice2 []string) []string {
@@ -1260,6 +1335,196 @@ func intersect(slice1, slice2 []string) []string {
 	return nn
 }
 
+func getEcsClientByID(volumeID, uid string) (ecsClient *ecs.Client, err error) {
+	// feature gate not enable;
+	if !GlobalConfigVar.DiskMultiTenantEnable {
+		ecsClient = updateEcsClient(GlobalConfigVar.EcsClient)
+		return ecsClient, nil
+	}
+
+	// volumeId not empty, get uid from pv;
+	if uid == "" && volumeID != "" {
+		uid, err = getTenantUIDByVolumeID(volumeID)
+		if err != nil {
+			return nil, perrors.Wrapf(err, "get uid by volumeId, volumeId=%s", volumeID)
+		}
+	}
+
+	// uid always empty after describe pv spec, use GlobalConfigVar.EcsClient
+	if uid == "" {
+		ecsClient = updateEcsClient(GlobalConfigVar.EcsClient)
+		return ecsClient, nil
+	}
+
+	// create role client with uid;
+	if ecsClient, err = createRoleClient(uid); err != nil {
+		return nil, perrors.Wrapf(err, "createRoleClient, tenant uid=%s", uid)
+	}
+	return ecsClient, nil
+}
+
+func getTenantUIDByVolumeID(volumeID string) (uid string, err error) {
+	// external-provisioner已经保证了PV的名字 == req.VolumeId
+	// 如果是静态PV，需要告知用户将PV#Name和PV#spec.volumeHandler配成一致
+	pv, err := GlobalConfigVar.ClientSet.CoreV1().PersistentVolumes().Get(context.Background(), volumeID, metav1.GetOptions{ResourceVersion: "0"})
+	if err != nil {
+		return "", perrors.Wrapf(err, "get pv, volumeId=%s", volumeID)
+	}
+	if pv.Spec.CSI == nil {
+		return "", perrors.Errorf("pv.Spec.CSI is nil, volumeId=%s", volumeID)
+	}
+	return pv.Spec.CSI.VolumeAttributes[TenantUserUID], nil
+}
+
+func createRoleClient(uid string) (cli *ecs.Client, err error) {
+	if uid == "" {
+		return nil, errors.New("uid is empty")
+	}
+	ac := utils.GetDefaultRoleAK()
+	if len(ac.AccessKeyID) == 0 || len(ac.AccessKeySecret) == 0 {
+		return nil, errors.New("role access key id or secret is empty")
+	}
+	if len(ac.RoleArn) == 0 {
+		return nil, errors.New("role arn is empty")
+	}
+
+	roleCli, err := sts.NewClientWithAccessKey(GetRegionID(), ac.AccessKeyID, ac.AccessKeySecret)
+	if err != nil {
+		return nil, perrors.Wrapf(err, "sts.NewClientWithAccessKey")
+	}
+	req := sts.CreateAssumeRoleRequest()
+	req.RoleArn = fmt.Sprintf("acs:ram::%s:role/%s", uid, ac.RoleArn)
+	req.RoleSessionName = "ack-csi"
+	req.DurationSeconds = requests.NewInteger(3600)
+	// 必须https
+	req.Scheme = "https"
+
+	resp, err := roleCli.AssumeRole(req)
+	if err != nil {
+		return nil, perrors.Wrapf(err, "AssumeRole")
+	}
+	ac = utils.AccessControl{AccessKeyID: resp.Credentials.AccessKeyId, AccessKeySecret: resp.Credentials.AccessKeySecret, StsToken: resp.Credentials.SecurityToken, UseMode: utils.EcsRAMRole}
+	cli = newEcsClient(ac)
+	if cli.Client.GetConfig() != nil {
+		cli.Client.GetConfig().UserAgent = KubernetesAlicloudIdentity
+	}
+	return cli, nil
+}
+
+// staticVolumeCreate 检查输入参数，如果包含了云盘ID，则直接使用云盘进行返回；
+// 根据云盘ID请求云盘的具体属性，并作为pv参数返回；
+func staticVolumeCreate(req *csi.CreateVolumeRequest) (*csi.Volume, error) {
+	paras := req.GetParameters()
+	diskID := paras[annDiskID]
+	if diskID == "" {
+		return nil, nil
+	}
+
+	ecsClient, err := getEcsClientByID("", req.Parameters[TenantUserUID])
+	if err != nil {
+		return nil, err
+	}
+	disk, err := findDiskByID(diskID, ecsClient)
+	if err != nil {
+		return nil, err
+	}
+	if disk == nil {
+		return nil, perrors.Errorf("Disk %s cannot be found from ecs api", diskID)
+	}
+
+	volumeContext := req.GetParameters()
+	volumeContext = updateVolumeContext(volumeContext)
+	volumeContext["type"] = disk.Category
+	volSizeBytes := int64(req.GetCapacityRange().GetRequiredBytes())
+	diskSizeBytes := int64(disk.Size) * 1024 * 1024 * 1024
+	if volSizeBytes != diskSizeBytes {
+		return nil, perrors.Errorf("Disk %s is not expected capacity: expected(%d), disk(%d)", diskID, volSizeBytes, diskSizeBytes)
+	}
+
+	tmpVol := &csi.Volume{
+		VolumeId:      diskID,
+		CapacityBytes: volSizeBytes,
+		VolumeContext: volumeContext,
+		AccessibleTopology: []*csi.Topology{
+			{
+				Segments: map[string]string{
+					TopologyZoneKey: disk.ZoneId,
+				},
+			},
+		},
+	}
+	return tmpVol, nil
+}
+
+// updateVolumeContext remove unneccessary volume context
+func updateVolumeContext(volumeContext map[string]string) map[string]string {
+	for _, key := range []string{LastApplyKey, PvNameKey, PvcNameKey, PvcNamespaceKey, StorageProvisionerKey, "csi.alibabacloud.com/reclaimPolicy", "csi.alibabacloud.com/storageclassName", "allowVolumeExpansion", "volume.kubernetes.io/selected-node"} {
+		if _, ok := volumeContext[key]; ok {
+			delete(volumeContext, key)
+		}
+	}
+
+	return volumeContext
+}
+
+func getSnapshotInfoByID(snapshotID string) (string, string, *timestamp.Timestamp) {
+	content, err := GlobalConfigVar.SnapClient.SnapshotV1().VolumeSnapshotContents().Get(context.TODO(), snapshotID, metav1.GetOptions{})
+	if err != nil {
+		log.Errorf("getSnapshotContentByID:: get snapshot content in cluster err: %v", content)
+		return "", "", nil
+	}
+	if targetRegion, ok := content.Labels[RemoteSnapshotLabelKey]; ok {
+		if volumeID, ok := content.Labels[SnapshotVolumeKey]; ok {
+			return targetRegion, volumeID, &timestamp.Timestamp{Seconds: int64(content.CreationTimestamp.Second())}
+		}
+	}
+
+	return "", "", nil
+}
+
+// getVolumeCount
+func getVolumeCount() int64 {
+	ecsClient := updateEcsClient(GlobalConfigVar.EcsClient)
+	instanceType := ""
+	var err error
+	volumeCount := int64(MaxVolumesPerNode)
+
+	for i := 0; i < 5; i++ {
+		// get instance type for node
+		if instanceType == "" {
+			instanceType, err = utils.GetMetaData("instance/instance-type")
+			if err != nil {
+				log.Warnf("getVolumeCount: get instance type with error: %s", err.Error())
+				time.Sleep(time.Duration(1) * time.Second)
+				continue
+			}
+		}
+
+		// describe ecs instance type
+		req := ecs.CreateDescribeInstanceTypesRequest()
+		req.RegionId = GlobalConfigVar.Region
+		req.InstanceTypes = &[]string{instanceType}
+		response, err := ecsClient.DescribeInstanceTypes(req)
+		// if auth failed, return with default
+		if err != nil && strings.Contains(err.Error(), "Forbidden") {
+			log.Errorf("getVolumeCount: describe instance type with error: %s", err.Error())
+			return MaxVolumesPerNode
+			// not forbidden error, retry
+		} else if err != nil && !strings.Contains(err.Error(), "Forbidden") {
+			time.Sleep(time.Duration(1) * time.Second)
+			continue
+		}
+		if len(response.InstanceTypes.InstanceType) != 1 {
+			log.Warnf("getVolumeCount: get instance max volume failed type with %v", response)
+			return MaxVolumesPerNode
+		}
+		volumeCount = int64(response.InstanceTypes.InstanceType[0].DiskQuantity) - 2
+		log.Infof("getVolumeCount: get instance max volume %d type with response %v", volumeCount, response)
+		break
+	}
+	return volumeCount
+}
+
 // hasMountOption return boolean value indicating whether the slice contains a mount option
 func hasMountOption(options []string, opt string) bool {
 	for _, o := range options {
@@ -1268,4 +1533,56 @@ func hasMountOption(options []string, opt string) bool {
 		}
 	}
 	return false
+}
+
+// checkRundVolumeExpand
+func checkRundVolumeExpand(req *csi.NodeExpandVolumeRequest) (bool, error) {
+	pvName := utils.GetPvNameFormPodMnt(req.VolumePath)
+	if pvName == "" {
+		return false, perrors.Errorf("cannot get pvname from volumePath %s for volume %s", req.VolumePath, req.VolumeId)
+	}
+	socketFile := filepath.Join(RundSocketDir, pvName)
+	if !utils.IsFileExisting(socketFile) {
+		return false, nil
+	}
+
+	// connect to rund server with timeout
+	clientConn, err := net.DialTimeout("unix", socketFile, 1*time.Second)
+	if err != nil {
+		log.Errorf("checkRundExpand: volume %s, volumepath %s, connect to rund server with error: %s", req.VolumeId, req.VolumePath, err.Error())
+		return true, perrors.Errorf("checkRundExpand: volume %s, volumepath %s, connect to rund server with error: %s", req.VolumeId, req.VolumePath, err.Error())
+	}
+	defer clientConn.Close()
+
+	// send volume spec to rund to expand volume fs
+	volumeSize := strconv.FormatInt(req.GetCapacityRange().GetRequiredBytes(), 10)
+	client := proto.NewExtendedStatusClient(ttrpc.NewClient(clientConn))
+	resp, err := client.ExpandVolume(context.Background(), &proto.ExpandVolumeRequest{
+		Volume: pvName,
+	})
+	if err != nil {
+		log.Errorf("checkRundExpand: volume %s, volumepath %s, connect to rund server with error response: %s", req.VolumeId, req.VolumePath, err.Error())
+		return true, perrors.Errorf("checkRundExpand: volume %s, volumepath %s, connect to rund server with error response: %s", req.VolumeId, req.VolumePath, err.Error())
+	}
+
+	log.Infof("RundVolumeExpand: Expand VolumeFS(%s) to(%s) successful with response: %s", pvName, volumeSize, resp)
+	return true, nil
+}
+
+func checkOption(opt string) bool {
+	switch opt {
+	case "enable", "true", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
+func checkOptionFalse(opt string) bool {
+	switch opt {
+	case "disable", "false", "no":
+		return true
+	default:
+		return false
+	}
 }

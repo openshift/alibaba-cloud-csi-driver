@@ -26,6 +26,7 @@ import (
 	"github.com/aliyun/alibaba-cloud-sdk-go/services/ecs"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-csi/drivers/pkg/csi-common"
+	snapClientset "github.com/kubernetes-csi/external-snapshotter/client/v4/clientset/versioned"
 	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/utils"
 	log "github.com/sirupsen/logrus"
 	crd "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
@@ -75,6 +76,8 @@ type GlobalConfig struct {
 	DiskPartitionEnable   bool
 	ControllerService     bool
 	BdfHealthCheck        bool
+	DiskMultiTenantEnable bool
+	SnapClient            *snapClientset.Clientset
 }
 
 // define global variable
@@ -96,7 +99,7 @@ func NewDriver(nodeID, endpoint string, runAsController bool) *DISK {
 	tmpdisk.endpoint = endpoint
 
 	if nodeID == "" {
-		nodeID = GetMetaData(InstanceID)
+		nodeID = utils.RetryGetMetaData(InstanceID)
 		log.Infof("Use node id : %s", nodeID)
 	}
 	csiDriver := csicommon.NewCSIDriver(driverName, csiVersion, nodeID)
@@ -161,6 +164,7 @@ func GlobalConfigSet(client *ecs.Client, region, nodeID string) *restclient.Conf
 	isDiskDetachDisable := false
 	isDiskDetachBeforeDelete := true
 	isDiskBdfEnable := false
+	isDiskMultiTenantEnable := false
 
 	// Global Configs Set
 	cfg, err := clientcmd.BuildConfigFromFlags(masterURL, kubeconfig)
@@ -171,55 +175,59 @@ func GlobalConfigSet(client *ecs.Client, region, nodeID string) *restclient.Conf
 	if err != nil {
 		log.Fatalf("Error building kubernetes clientset: %s", err.Error())
 	}
+	snapClient, err := snapClientset.NewForConfig(cfg)
+	if err != nil {
+		log.Fatalf("Error building kubernetes snapclientset: %s", err.Error())
+	}
 
 	configMap, err := kubeClient.CoreV1().ConfigMaps("kube-system").Get(context.Background(), configMapName, metav1.GetOptions{})
 	if err != nil {
 		log.Infof("Not found configmap named as csi-plugin under kube-system, with: %v", err)
 	} else {
 		if value, ok := configMap.Data["disk-adcontroller-enable"]; ok {
-			if value == "enable" || value == "yes" || value == "true" {
+			if checkOption(value) {
 				log.Infof("AD-Controller is enabled by configMap(%s), CSI Disk Plugin running in AD Controller mode.", value)
 				isADControllerEnable = true
-			} else if value == "disable" || value == "no" || value == "false" {
+			} else if checkOptionFalse(value) {
 				log.Infof("AD-Controller is disable by configMap(%s), CSI Disk Plugin running in kubelet mode.", value)
 				isADControllerEnable = false
 			}
 		}
 		if value, ok := configMap.Data["disk-tag-enable"]; ok {
-			if value == "enable" || value == "yes" || value == "true" {
+			if checkOption(value) {
 				log.Infof("Disk Tag is enabled by configMap(%s).", value)
 				isDiskTagEnable = true
 			}
 		}
 		if value, ok := configMap.Data["disk-metric-enable"]; ok {
-			if value == "enable" || value == "yes" || value == "true" {
+			if checkOption(value) {
 				log.Infof("Disk Metric is enabled by configMap(%s).", value)
 				isDiskMetricEnable = true
 			}
 		}
 		if value, ok := configMap.Data["disk-detach-disable"]; ok {
-			if value == "enable" || value == "yes" || value == "true" {
+			if checkOption(value) {
 				log.Infof("Disk Detach is disabled by configMap(%s), this tag only works when adcontroller enabled.", value)
 				isDiskDetachDisable = true
-			} else if value == "disable" || value == "no" || value == "false" {
+			} else if checkOptionFalse(value) {
 				log.Infof("Disk Detach is enable by configMap(%s), this tag only works when adcontroller enabled.", value)
 				isDiskDetachDisable = false
 			}
 		}
 		if value, ok := configMap.Data["disk-detach-before-delete"]; ok {
-			if value == "enable" || value == "yes" || value == "true" {
+			if checkOption(value) {
 				log.Infof("Disk Detach before delete is enabled by configMap(%s).", value)
 				isDiskDetachBeforeDelete = true
-			} else if value == "disable" || value == "no" || value == "false" {
+			} else if checkOptionFalse(value) {
 				log.Infof("Disk Detach before delete is diskable by configMap(%s).", value)
 				isDiskDetachBeforeDelete = false
 			}
 		}
 		if value, ok := configMap.Data["disk-bdf-enable"]; ok {
-			if value == "enable" || value == "yes" || value == "true" {
+			if checkOption(value) {
 				log.Infof("Disk Bdf is enabled by configMap(%s).", value)
 				isDiskBdfEnable = true
-			} else if value == "disable" || value == "no" || value == "false" {
+			} else if checkOptionFalse(value) {
 				log.Infof("Disk Bdf is disable by configMap(%s).", value)
 				isDiskBdfEnable = false
 			}
@@ -324,6 +332,13 @@ func GlobalConfigSet(client *ecs.Client, region, nodeID string) *restclient.Conf
 	if os.Getenv("BDF_HEALTH_CHECK") == "false" {
 		bdfCheck = false
 	}
+	diskMultiTenantEnable := os.Getenv(DiskMultiTenantEnable)
+	if diskMultiTenantEnable == "true" || diskMultiTenantEnable == "yes" {
+		log.Infof("Multi tenant is Enabled")
+		isDiskMultiTenantEnable = true
+	} else if diskMultiTenantEnable == "false" || diskMultiTenantEnable == "no" {
+		isDiskMultiTenantEnable = false
+	}
 
 	log.Infof("Starting with GlobalConfigVar: region(%s), NodeID(%s), ADControllerEnable(%t), DiskTagEnable(%t), DiskBdfEnable(%t), MetricEnable(%t), RunTimeClass(%s), DetachDisabled(%t), DetachBeforeDelete(%t), ClusterID(%s)", region, nodeID, isADControllerEnable, isDiskTagEnable, isDiskBdfEnable, isDiskMetricEnable, runtimeValue, isDiskDetachDisable, isDiskDetachBeforeDelete, clustID)
 	// Global Config Set
@@ -341,11 +356,13 @@ func GlobalConfigSet(client *ecs.Client, region, nodeID string) *restclient.Conf
 		DetachBeforeDelete:    isDiskDetachBeforeDelete,
 		DetachBeforeAttach:    isDetachBeforeAttached,
 		ClientSet:             kubeClient,
+		SnapClient:            snapClient,
 		FilesystemLosePercent: fileSystemLosePercent,
 		ClusterID:             clustID,
 		DiskPartitionEnable:   partition,
 		ControllerService:     controllerServerType,
 		BdfHealthCheck:        bdfCheck,
+		DiskMultiTenantEnable: isDiskMultiTenantEnable,
 	}
 	return cfg
 }

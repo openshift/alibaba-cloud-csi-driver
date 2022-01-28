@@ -12,7 +12,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get", "list"]
+    verbs: ["get", "list", "create"]
   - apiGroups: [""]
     resources: ["persistentvolumes"]
     verbs: ["get", "list", "watch", "update", "create", "delete", "patch"]
@@ -48,7 +48,7 @@ rules:
     verbs: ["get", "list", "watch", "update", "patch"]
   - apiGroups: ["snapshot.storage.k8s.io"]
     resources: ["volumesnapshotclasses"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "create"]
   - apiGroups: ["snapshot.storage.k8s.io"]
     resources: ["volumesnapshotcontents"]
     verbs: ["create", "get", "list", "watch", "update", "delete"]
@@ -93,7 +93,7 @@ roleRef:
   name: alicloud-csi-plugin
   apiGroup: rbac.authorization.k8s.io
 ---
-apiVersion: storage.k8s.io/v1beta1
+apiVersion: storage.k8s.io/v1
 kind: CSIDriver
 metadata:
   name: diskplugin.csi.alibabacloud.com
@@ -101,7 +101,7 @@ spec:
   attachRequired: true
   podInfoOnMount: true
 ---
-apiVersion: storage.k8s.io/v1beta1
+apiVersion: storage.k8s.io/v1
 kind: CSIDriver
 metadata:
   name: nasplugin.csi.alibabacloud.com
@@ -109,7 +109,7 @@ spec:
   attachRequired: false
   podInfoOnMount: true
 ---
-apiVersion: storage.k8s.io/v1beta1
+apiVersion: storage.k8s.io/v1
 kind: CSIDriver
 metadata:
   name: ossplugin.csi.alibabacloud.com
@@ -150,7 +150,7 @@ spec:
       hostPID: true
       containers:
         - name: disk-driver-registrar
-          image: registry.cn-hangzhou.aliyuncs.com/acs/csi-node-driver-registrar:v1.2.0
+          image: registry.cn-hangzhou.aliyuncs.com/acs/csi-node-driver-registrar:v1.3.0-6e9fff3-aliyun
           imagePullPolicy: Always
           args:
             - "--v=5"
@@ -162,7 +162,7 @@ spec:
             - name: registration-dir
               mountPath: /registration
         - name: nas-driver-registrar
-          image: registry.cn-hangzhou.aliyuncs.com/acs/csi-node-driver-registrar:v1.2.0
+          image: registry.cn-hangzhou.aliyuncs.com/acs/csi-node-driver-registrar:v1.3.0-6e9fff3-aliyun
           imagePullPolicy: Always
           args:
             - "--v=5"
@@ -174,7 +174,7 @@ spec:
             - name: registration-dir
               mountPath: /registration
         - name: oss-driver-registrar
-          image: registry.cn-hangzhou.aliyuncs.com/acs/csi-node-driver-registrar:v1.2.0
+          image: registry.cn-hangzhou.aliyuncs.com/acs/csi-node-driver-registrar:v1.3.0-6e9fff3-aliyun
           imagePullPolicy: Always
           args:
             - "--v=5"
@@ -191,7 +191,7 @@ spec:
             capabilities:
               add: ["SYS_ADMIN"]
             allowPrivilegeEscalation: true
-          image: registry.cn-hangzhou.aliyuncs.com/acs/csi-plugin:v1.18.8.47-906bd535-aliyun
+          image: registry.cn-hangzhou.aliyuncs.com/acs/csi-plugin:v1.20.7-aafce42-aliyun
           imagePullPolicy: "Always"
           args:
             - "--endpoint=$(CSI_ENDPOINT)"

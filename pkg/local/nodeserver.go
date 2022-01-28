@@ -97,18 +97,21 @@ var (
 	DeviceChars = []string{"b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z"}
 )
 
-// NewNodeServer create a NodeServer object
-func NewNodeServer(d *csicommon.CSIDriver, dName, nodeID string) csi.NodeServer {
+func newKubeClient() *kubernetes.Clientset {
 	cfg, err := clientcmd.BuildConfigFromFlags(masterURL, kubeconfig)
 	if err != nil {
 		log.Fatalf("Error building kubeconfig: %s", err.Error())
 	}
-
 	kubeClient, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		log.Fatalf("Error building kubernetes clientset: %s", err.Error())
 	}
+	return kubeClient
+}
 
+// NewNodeServer create a NodeServer object
+func NewNodeServer(d *csicommon.CSIDriver, dName, nodeID string) csi.NodeServer {
+	kubeClient := newKubeClient()
 	mounter := k8smount.New("")
 	serviceType := os.Getenv(utils.ServiceType)
 	if len(serviceType) == 0 || serviceType == "" {
@@ -118,8 +121,9 @@ func NewNodeServer(d *csicommon.CSIDriver, dName, nodeID string) csi.NodeServer 
 	if serviceType == utils.PluginService {
 		// local volume daemon
 		// GRPC server to provide volume manage
-		go server.Start()
-
+		ch := make(chan bool)
+		go server.Start(kubeClient, ch)
+		<-ch
 		// pv handler
 		// watch pv/pvc annotations and provide volume manage
 		go generator.VolumeHandler()
@@ -297,15 +301,25 @@ func (ns *nodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 }
 
 func (ns *nodeServer) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
-	return &csi.NodeGetInfoResponse{
+	nodeInfo := &csi.NodeGetInfoResponse{
 		NodeId: ns.nodeID,
 		// make sure that the driver works on this particular node only
 		AccessibleTopology: &csi.Topology{
 			Segments: map[string]string{
-				TopologyNodeKey: ns.nodeID,
+				types.GlobalConfigVar.TopoKeyDefine: ns.nodeID,
 			},
 		},
-	}, nil
+	}
+
+	if types.GlobalConfigVar.HostNameAsTopo {
+		hostName, err := utils.Run("hostname")
+		if err != nil {
+			return nil, fmt.Errorf("NodeGetInfo: Get Node(%s) HostName error: %v ", ns.nodeID, err)
+		}
+		nodeInfo.NodeId = string(hostName)
+		nodeInfo.AccessibleTopology.Segments[types.GlobalConfigVar.TopoKeyDefine] = string(hostName)
+	}
+	return nodeInfo, nil
 }
 
 // NodeGetVolumeStats used for csi metrics

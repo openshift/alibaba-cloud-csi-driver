@@ -292,7 +292,7 @@ func addDiskBdfTag(devices []string) ([]string, error) {
 	}
 
 	// filter untaged disks
-	GlobalConfigVar.EcsClient = updateEcsClent(GlobalConfigVar.EcsClient)
+	GlobalConfigVar.EcsClient = updateEcsClient(GlobalConfigVar.EcsClient)
 	disksResponse, err := getDiskList(disks)
 	if err != nil {
 		return disks, err

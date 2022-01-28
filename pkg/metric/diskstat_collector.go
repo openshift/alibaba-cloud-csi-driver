@@ -13,6 +13,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -449,7 +450,6 @@ func (p *diskStatCollector) updateDiskInfoMap(thisPvDiskInfoMap map[string]diskI
 		if !ok || thisInfo.VolDataPath != lastInfo.VolDataPath {
 			pvcNamespace, pvcName, err := getPvcByPvNameByDisk(p.clientSet, pv)
 			if err != nil {
-				logrus.Errorf("Get pvc by pv %s is failed, err:%s", pv, err.Error())
 				continue
 			}
 			updateInfo := diskInfo{
@@ -484,7 +484,7 @@ func getDiskStats() (map[string][]string, error) {
 }
 
 func getGlobalMountPathByPvName(pvName string, info *diskInfo) {
-	info.GlobalMountPath = fmt.Sprintf("/var/lib/kubelet/plugins/kubernetes.io/csi/pv/%s/globalmount", pvName)
+	info.GlobalMountPath = filepath.Join(utils.KubeletRootDir, "/plugins/kubernetes.io/csi/pv/", pvName, "/globalmount")
 }
 
 func getDiskCapacityMetric(pvName string, info *diskInfo, stat []string) ([]string, error) {

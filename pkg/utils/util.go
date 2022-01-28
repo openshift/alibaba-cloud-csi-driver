@@ -26,6 +26,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"io"
 	"io/ioutil"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -37,13 +38,16 @@ import (
 	"k8s.io/client-go/tools/record"
 	k8svol "k8s.io/kubernetes/pkg/volume"
 	"k8s.io/kubernetes/pkg/volume/util/fs"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -82,6 +86,13 @@ const (
 	PluginService = "plugin"
 	// ProvisionerService represents the csi-provisioner type.
 	ProvisionerService = "provisioner"
+	// InstallSnapshotCRD tag
+	InstallSnapshotCRD = "INSTALL_SNAPSHOT_CRD"
+	// MetadataMaxRetrycount ...
+	MetadataMaxRetrycount = 4
+
+	// NsenterCmd is the nsenter command
+	NsenterCmd = "/nsenter --mount=/proc/1/ns/mnt --ipc=/proc/1/ns/ipc --net=/proc/1/ns/net --uts=/proc/1/ns/uts "
 )
 
 // KubernetesAlicloudIdentity set a identity label
@@ -201,6 +212,24 @@ func CreateDest(dest string) error {
 	return nil
 }
 
+//IsLikelyNotMountPoint return status of mount point,this function fix IsMounted return 0 bug
+func IsLikelyNotMountPoint(file string) (bool, error) {
+	stat, err := os.Stat(file)
+	if err != nil {
+		return true, err
+	}
+	rootStat, err := os.Stat(filepath.Dir(strings.TrimSuffix(file, "/")))
+	if err != nil {
+		return true, err
+	}
+	// If the directory has a different device as parent, then it is a mountpoint.
+	if stat.Sys().(*syscall.Stat_t).Dev != rootStat.Sys().(*syscall.Stat_t).Dev {
+		return false, nil
+	}
+
+	return true, nil
+}
+
 // IsMounted return status of mount operation
 func IsMounted(mountPath string) bool {
 	cmd := fmt.Sprintf("mount | grep %s | grep -v grep | wc -l", mountPath)
@@ -262,6 +291,22 @@ func GetMetaData(resource string) (string, error) {
 		return "", err
 	}
 	return string(body), nil
+}
+
+// RetryGetMetaData ...
+func RetryGetMetaData(resource string) string {
+	var nodeID string
+	for i := 0; i < MetadataMaxRetrycount; i++ {
+		nodeID, _ = GetMetaData(resource)
+		if strings.Contains(nodeID, "Error 500 Internal Server Error") {
+			if i == MetadataMaxRetrycount-1 {
+				log.Fatalf("NewDriver:: Access metadata server failed: %v", nodeID)
+			}
+			continue
+		}
+		return nodeID
+	}
+	return nodeID
 }
 
 // GetRegionIDAndInstanceID get regionID and instanceID object
@@ -512,4 +557,115 @@ func Ping(ipAddress string) (*ping.Statistics, error) {
 	pinger.Run()
 	stats := pinger.Statistics()
 	return stats, nil
+}
+
+// IsDirTmpfs check path is tmpfs mounted or not
+func IsDirTmpfs(path string) bool {
+	cmd := fmt.Sprintf("findmnt %s -o FSTYPE -n", path)
+	fsType, err := Run(cmd)
+	if err == nil && strings.TrimSpace(fsType) == "tmpfs" {
+		return true
+	}
+	return false
+}
+
+// WriteAndSyncFile behaves just like ioutil.WriteFile in the standard library,
+// but calls Sync before closing the file. WriteAndSyncFile guarantees the data
+// is synced if there is no error returned.
+func WriteAndSyncFile(filename string, data []byte, perm os.FileMode) error {
+	f, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	n, err := f.Write(data)
+	if err == nil && n < len(data) {
+		err = io.ErrShortWrite
+	}
+	if err == nil {
+		err = Fsync(f)
+	}
+	if err1 := f.Close(); err == nil {
+		err = err1
+	}
+	return err
+}
+
+// Fsync is a wrapper around file.Sync(). Special handling is needed on darwin platform.
+func Fsync(f *os.File) error {
+	return f.Sync()
+}
+
+//GetNodeAddr get node address
+func GetNodeAddr(client kubernetes.Interface, node string, port string) (string, error) {
+	ip, err := GetNodeIP(client, node)
+	if err != nil {
+		return "", err
+	}
+	return ip.String() + ":" + port, nil
+}
+
+// GetNodeIP get node address
+func GetNodeIP(client kubernetes.Interface, nodeID string) (net.IP, error) {
+	node, err := client.CoreV1().Nodes().Get(context.Background(), nodeID, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	addresses := node.Status.Addresses
+	addressMap := make(map[v1.NodeAddressType][]v1.NodeAddress)
+	for i := range addresses {
+		addressMap[addresses[i].Type] = append(addressMap[addresses[i].Type], addresses[i])
+	}
+	if addresses, ok := addressMap[v1.NodeInternalIP]; ok {
+		return net.ParseIP(addresses[0].Address), nil
+	}
+	if addresses, ok := addressMap[v1.NodeExternalIP]; ok {
+		return net.ParseIP(addresses[0].Address), nil
+	}
+	return nil, fmt.Errorf("Node IP unknown; known addresses: %v", addresses)
+}
+
+//CheckParameterValidate is check parameter validating in csi-plugin
+func CheckParameterValidate(inputs []string) bool {
+	for _, input := range inputs {
+		if matched, err := regexp.MatchString("^[A-Za-z0-9=._@:~/-]*$", input); err != nil || !matched {
+			return false
+		}
+	}
+	return true
+}
+
+//CheckQuotaPathValidate is check quota path validating in csi-plugin
+func CheckQuotaPathValidate(kubeClient *kubernetes.Clientset, path string) error {
+	pvName := filepath.Base(path)
+	_, err := kubeClient.CoreV1().PersistentVolumes().Get(context.Background(), pvName, metav1.GetOptions{})
+	if err != nil {
+		log.Errorf("utils.CheckQuotaPathValidate %s cannot find volume, error: %s", path, err.Error())
+		return err
+	}
+	return nil
+}
+
+//IsHostFileExist is check host file is existing in lvm
+func IsHostFileExist(path string) bool {
+	args := []string{NsenterCmd, "stat", path}
+	cmd := strings.Join(args, " ")
+	out, err := Run(cmd)
+	if err != nil && strings.Contains(out, "No such file or directory") {
+		return false
+	}
+
+	return true
+}
+
+// GetPvNameFormPodMnt get pv name
+func GetPvNameFormPodMnt(mntPath string) string {
+	if mntPath == "" {
+		return ""
+	}
+	if strings.HasSuffix(mntPath, "/mount") {
+		tmpPath := mntPath[0 : len(mntPath)-6]
+		pvName := filepath.Base(tmpPath)
+		return pvName
+	}
+	return ""
 }
