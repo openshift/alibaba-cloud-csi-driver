@@ -5,9 +5,9 @@ COPY . .
 RUN build/build-all.sh noimage
 
 FROM registry.ci.openshift.org/ocp/4.10:base
-# Get mkfs & blkid
+# Get mkfs & blkid & pciutils
 RUN yum update -y && \
-    yum install --setopt=tsflags=nodocs -y e2fsprogs xfsprogs util-linux ca-certificates file tzdata nfs-utils && \
+    yum install --setopt=tsflags=nodocs -y e2fsprogs xfsprogs util-linux ca-certificates file tzdata nfs-utils pciutils && \
     yum clean all && rm -rf /var/cache/yum/*
 
 COPY --from=builder /go/src/github.com/kubernetes-sigs/alibaba-cloud-csi-driver/plugin.csi.alibabacloud.com  /usr/bin/
