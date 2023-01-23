@@ -60,7 +60,7 @@ const (
 	DdbfROOT = "/mnt/dbfs/"
 )
 
-//newNodeServer create the csi node server
+// newNodeServer create the csi node server
 func newNodeServer(d *DBFS) *nodeServer {
 	cfg, err := clientcmd.BuildConfigFromFlags(masterURL, kubeconfig)
 	if err != nil {
