@@ -87,7 +87,7 @@ const (
 	NasMntPoint = "/mnt/nasplugin.alibabacloud.com"
 )
 
-//newNodeServer create the csi node server
+// newNodeServer create the csi node server
 func newNodeServer(d *NAS) *nodeServer {
 	cfg, err := clientcmd.BuildConfigFromFlags(masterURL, kubeconfig)
 	if err != nil {
