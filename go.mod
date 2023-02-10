@@ -42,7 +42,8 @@ require (
 	k8s.io/client-go v0.19.0
 	k8s.io/kube-openapi v0.0.0-20200811211545-daf3cbb84823 // indirect
 	k8s.io/kubernetes v1.18.8
-	k8s.io/utils v0.0.0-20200324210504-a9aa75ae1b89
+	k8s.io/mount-utils v0.21.1
+	k8s.io/utils v0.0.0-20211116205334-6203023598ed
 )
 
 replace (
