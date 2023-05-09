@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -ex
-REPO_NAME=JiaoDean
 
-GOPATH=/Users/wangjiao/go
+REPO_NAME=$2
+
+if [ "$REPO_NAME" == "" ]; then
+    REPO_NAME="kubernetes-sigs"
+fi
 
 cd ${GOPATH}/src/github.com/$REPO_NAME/alibaba-cloud-csi-driver/
 GIT_SHA=`git rev-parse --short HEAD || echo "HEAD"`
