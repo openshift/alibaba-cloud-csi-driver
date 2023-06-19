@@ -25,12 +25,14 @@ import (
 
 	"github.com/aliyun/alibaba-cloud-sdk-go/services/ecs"
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"github.com/kubernetes-csi/drivers/pkg/csi-common"
+	csicommon "github.com/kubernetes-csi/drivers/pkg/csi-common"
 	snapClientset "github.com/kubernetes-csi/external-snapshotter/client/v4/clientset/versioned"
+	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/log"
+	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/options"
 	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/utils"
-	log "github.com/sirupsen/logrus"
 	crd "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -38,9 +40,10 @@ import (
 
 // PluginFolder defines the location of diskplugin
 const (
-	driverName      = "diskplugin.csi.alibabacloud.com"
-	csiVersion      = "1.0.0"
-	TopologyZoneKey = "topology." + driverName + "/zone"
+	driverName              = "diskplugin.csi.alibabacloud.com"
+	csiVersion              = "1.0.0"
+	TopologyZoneKey         = "topology." + driverName + "/zone"
+	TopologyMultiZonePrefix = TopologyZoneKey + "-"
 )
 
 // DISK the DISK object
@@ -60,9 +63,10 @@ type GlobalConfig struct {
 	EcsClient             *ecs.Client
 	Region                string
 	NodeID                string
-	AttachMutex           sync.RWMutex
+	ZoneID                string
 	CanAttach             bool
 	DiskTagEnable         bool
+	AttachMutex           sync.RWMutex
 	ADControllerEnable    bool
 	DetachDisabled        bool
 	MetricEnable          bool
@@ -78,12 +82,15 @@ type GlobalConfig struct {
 	BdfHealthCheck        bool
 	DiskMultiTenantEnable bool
 	SnapClient            *snapClientset.Clientset
+	NodeMultiZoneEnable   bool
+	WaitBeforeAttach      bool
+	AddonVMFatalEvents    []string
+	RequestBaseInfo       map[string]string
+	SnapshotBeforeDelete  bool
 }
 
 // define global variable
 var (
-	masterURL       string
-	kubeconfig      string
 	GlobalConfigVar GlobalConfig
 )
 
@@ -100,7 +107,7 @@ func NewDriver(nodeID, endpoint string, runAsController bool) *DISK {
 
 	if nodeID == "" {
 		nodeID = utils.RetryGetMetaData(InstanceID)
-		log.Infof("Use node id : %s", nodeID)
+		log.Log.Infof("Use node id : %s", nodeID)
 	}
 	csiDriver := csicommon.NewCSIDriver(driverName, csiVersion, nodeID)
 	tmpdisk.driver = csiDriver
@@ -113,32 +120,27 @@ func NewDriver(nodeID, endpoint string, runAsController bool) *DISK {
 	})
 	tmpdisk.driver.AddVolumeCapabilityAccessModes([]csi.VolumeCapability_AccessMode_Mode{csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER})
 
+	// Config Global vars
+	cfg := GlobalConfigSet(nodeID)
+
 	// Init ECS Client
 	accessControl := utils.GetAccessControl()
 	client := newEcsClient(accessControl)
 	if accessControl.UseMode == utils.EcsRAMRole || accessControl.UseMode == utils.ManagedToken {
-		log.Infof("Starting csi-plugin with sts.")
+		log.Log.Infof("Starting csi-plugin with sts.")
 	} else {
-		log.Infof("Starting csi-plugin without sts.")
+		log.Log.Infof("Starting csi-plugin without sts.")
 	}
-
-	// Set Region ID
-	regionID := os.Getenv("REGION_ID")
-	if regionID == "" {
-		regionID = GetRegionID()
-	}
-
-	// Config Global vars
-	cfg := GlobalConfigSet(client, regionID, nodeID)
+	GlobalConfigVar.EcsClient = client
 
 	apiExtentionClient, err := crd.NewForConfig(cfg)
 	if err != nil {
-		log.Fatalf("Error building kubernetes clientset: %s", err.Error())
+		log.Log.Fatalf("Error building kubernetes clientset: %s", err.Error())
 	}
 
 	// Create GRPC servers
 	tmpdisk.idServer = NewIdentityServer(tmpdisk.driver)
-	tmpdisk.controllerServer = NewControllerServer(tmpdisk.driver, apiExtentionClient, regionID)
+	tmpdisk.controllerServer = NewControllerServer(tmpdisk.driver, apiExtentionClient)
 
 	if !runAsController {
 		tmpdisk.nodeServer = NewNodeServer(tmpdisk.driver, client)
@@ -149,14 +151,14 @@ func NewDriver(nodeID, endpoint string, runAsController bool) *DISK {
 
 // Run start a new NodeServer
 func (disk *DISK) Run() {
-	log.Infof("Starting csi-plugin Driver: %v version: %v", driverName, csiVersion)
+	log.Log.Infof("Starting csi-plugin Driver: %v version: %v", driverName, csiVersion)
 	s := csicommon.NewNonBlockingGRPCServer()
 	s.Start(disk.endpoint, disk.idServer, disk.controllerServer, disk.nodeServer)
 	s.Wait()
 }
 
 // GlobalConfigSet set Global Config
-func GlobalConfigSet(client *ecs.Client, region, nodeID string) *restclient.Config {
+func GlobalConfigSet(nodeID string) *restclient.Config {
 	configMapName := "csi-plugin"
 	isADControllerEnable := false
 	isDiskTagEnable := false
@@ -165,88 +167,118 @@ func GlobalConfigSet(client *ecs.Client, region, nodeID string) *restclient.Conf
 	isDiskDetachBeforeDelete := true
 	isDiskBdfEnable := false
 	isDiskMultiTenantEnable := false
+	isNodeMultiZoneEnable := false
+
+	isWaitBeforeAttach := false
+	if waitBeforeAttach := os.Getenv("WAIT_BEFORE_ATTACH"); waitBeforeAttach == "true" {
+		isWaitBeforeAttach = true
+	}
 
 	// Global Configs Set
-	cfg, err := clientcmd.BuildConfigFromFlags(masterURL, kubeconfig)
+	cfg, err := clientcmd.BuildConfigFromFlags(options.MasterURL, options.Kubeconfig)
 	if err != nil {
-		log.Fatalf("Error building kubeconfig: %s", err.Error())
+		log.Log.Fatalf("Error building kubeconfig: %s", err.Error())
 	}
-	kubeClient, err := kubernetes.NewForConfig(cfg)
-	if err != nil {
-		log.Fatalf("Error building kubernetes clientset: %s", err.Error())
+	if qps := os.Getenv("KUBE_CLI_API_QPS"); qps != "" {
+		if qpsi, err := strconv.Atoi(qps); err == nil {
+			cfg.QPS = float32(qpsi)
+		}
 	}
+	if burst := os.Getenv("KUBE_CLI_API_BURST"); burst != "" {
+		if qpsi, err := strconv.Atoi(burst); err == nil {
+			cfg.Burst = qpsi
+		}
+	}
+	cfg.AcceptContentTypes = strings.Join([]string{runtime.ContentTypeProtobuf, runtime.ContentTypeJSON}, ",")
+	// snapshotClient does not support protobuf
 	snapClient, err := snapClientset.NewForConfig(cfg)
 	if err != nil {
-		log.Fatalf("Error building kubernetes snapclientset: %s", err.Error())
+		log.Log.Fatalf("Error building kubernetes snapclientset: %s", err.Error())
+	}
+
+	cfg.ContentType = runtime.ContentTypeProtobuf
+	kubeClient, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		log.Log.Fatalf("Error building kubernetes clientset: %s", err.Error())
 	}
 
 	configMap, err := kubeClient.CoreV1().ConfigMaps("kube-system").Get(context.Background(), configMapName, metav1.GetOptions{})
 	if err != nil {
-		log.Infof("Not found configmap named as csi-plugin under kube-system, with: %v", err)
+		log.Log.Infof("Not found configmap named as csi-plugin under kube-system, with: %v", err)
 	} else {
 		if value, ok := configMap.Data["disk-adcontroller-enable"]; ok {
 			if checkOption(value) {
-				log.Infof("AD-Controller is enabled by configMap(%s), CSI Disk Plugin running in AD Controller mode.", value)
+				log.Log.Infof("AD-Controller is enabled by configMap(%s), CSI Disk Plugin running in AD Controller mode.", value)
 				isADControllerEnable = true
 			} else if checkOptionFalse(value) {
-				log.Infof("AD-Controller is disable by configMap(%s), CSI Disk Plugin running in kubelet mode.", value)
+				log.Log.Infof("AD-Controller is disable by configMap(%s), CSI Disk Plugin running in kubelet mode.", value)
 				isADControllerEnable = false
 			}
 		}
 		if value, ok := configMap.Data["disk-tag-enable"]; ok {
 			if checkOption(value) {
-				log.Infof("Disk Tag is enabled by configMap(%s).", value)
+				log.Log.Infof("Disk Tag is enabled by configMap(%s).", value)
 				isDiskTagEnable = true
 			}
 		}
 		if value, ok := configMap.Data["disk-metric-enable"]; ok {
 			if checkOption(value) {
-				log.Infof("Disk Metric is enabled by configMap(%s).", value)
+				log.Log.Infof("Disk Metric is enabled by configMap(%s).", value)
 				isDiskMetricEnable = true
 			}
 		}
 		if value, ok := configMap.Data["disk-detach-disable"]; ok {
 			if checkOption(value) {
-				log.Infof("Disk Detach is disabled by configMap(%s), this tag only works when adcontroller enabled.", value)
+				log.Log.Infof("Disk Detach is disabled by configMap(%s), this tag only works when adcontroller enabled.", value)
 				isDiskDetachDisable = true
 			} else if checkOptionFalse(value) {
-				log.Infof("Disk Detach is enable by configMap(%s), this tag only works when adcontroller enabled.", value)
+				log.Log.Infof("Disk Detach is enable by configMap(%s), this tag only works when adcontroller enabled.", value)
 				isDiskDetachDisable = false
 			}
 		}
 		if value, ok := configMap.Data["disk-detach-before-delete"]; ok {
 			if checkOption(value) {
-				log.Infof("Disk Detach before delete is enabled by configMap(%s).", value)
+				log.Log.Infof("Disk Detach before delete is enabled by configMap(%s).", value)
 				isDiskDetachBeforeDelete = true
 			} else if checkOptionFalse(value) {
-				log.Infof("Disk Detach before delete is diskable by configMap(%s).", value)
+				log.Log.Infof("Disk Detach before delete is diskable by configMap(%s).", value)
 				isDiskDetachBeforeDelete = false
 			}
 		}
 		if value, ok := configMap.Data["disk-bdf-enable"]; ok {
 			if checkOption(value) {
-				log.Infof("Disk Bdf is enabled by configMap(%s).", value)
+				log.Log.Infof("Disk Bdf is enabled by configMap(%s).", value)
 				isDiskBdfEnable = true
 			} else if checkOptionFalse(value) {
-				log.Infof("Disk Bdf is disable by configMap(%s).", value)
+				log.Log.Infof("Disk Bdf is disable by configMap(%s).", value)
 				isDiskBdfEnable = false
 			}
 		}
 	}
 
 	// Env variables
+	avmfe := os.Getenv("ADDON_VM_FATAL_EVENTS")
+	fatalEvents := []string{}
+	if avmfe != "" {
+		if strings.Contains(avmfe, ",") {
+			fatalEvents = strings.Split(avmfe, ",")
+		} else {
+			fatalEvents = []string{avmfe}
+		}
+	}
+
 	adEnable := os.Getenv(DiskAttachByController)
 	if adEnable == "true" || adEnable == "yes" {
-		log.Infof("AD-Controller is enabled by Env(%s), CSI Disk Plugin running in AD Controller mode.", adEnable)
+		log.Log.Infof("AD-Controller is enabled by Env(%s), CSI Disk Plugin running in AD Controller mode.", adEnable)
 		isADControllerEnable = true
 	} else if adEnable == "false" || adEnable == "no" {
-		log.Infof("AD-Controller is disabled by Env(%s), CSI Disk Plugin running in kubelet mode.", adEnable)
+		log.Log.Infof("AD-Controller is disabled by Env(%s), CSI Disk Plugin running in kubelet mode.", adEnable)
 		isADControllerEnable = false
 	}
 	if isADControllerEnable {
-		log.Infof("AD-Controller is enabled, CSI Disk Plugin running in AD Controller mode.")
+		log.Log.Infof("AD-Controller is enabled, CSI Disk Plugin running in AD Controller mode.")
 	} else {
-		log.Infof("AD-Controller is disabled, CSI Disk Plugin running in kubelet mode.")
+		log.Log.Infof("AD-Controller is disabled, CSI Disk Plugin running in kubelet mode.")
 	}
 
 	isDetachBeforeAttached := true
@@ -299,19 +331,20 @@ func GlobalConfigSet(client *ecs.Client, region, nodeID string) *restclient.Conf
 		}
 	}
 
-	nodeName := os.Getenv("KUBE_NODE_NAME")
+	nodeName := os.Getenv(kubeNodeName)
 	runtimeValue := "runc"
 	nodeInfo, err := kubeClient.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
 	if err != nil {
-		log.Errorf("Describe node %s with error: %s", nodeName, err.Error())
+		log.Log.Errorf("GlobalConfigSet: get node %s with error: %s", nodeName, err.Error())
 	} else {
 		if value, ok := nodeInfo.Labels["alibabacloud.com/container-runtime"]; ok && strings.TrimSpace(value) == "Sandboxed-Container.runv" {
 			if value, ok := nodeInfo.Labels["alibabacloud.com/container-runtime-version"]; ok && strings.HasPrefix(strings.TrimSpace(value), "1.") {
 				runtimeValue = MixRunTimeMode
 			}
 		}
-		log.Infof("Describe node %s and Set RunTimeClass to %s", nodeName, runtimeValue)
+		log.Log.Infof("Describe node %s and Set RunTimeClass to %s", nodeName, runtimeValue)
 	}
+	regionID, zoneID, _ := getMeta(nodeInfo)
 	runtimeEnv := os.Getenv("RUNTIME")
 	if runtimeEnv == MixRunTimeMode {
 		runtimeValue = MixRunTimeMode
@@ -334,18 +367,30 @@ func GlobalConfigSet(client *ecs.Client, region, nodeID string) *restclient.Conf
 	}
 	diskMultiTenantEnable := os.Getenv(DiskMultiTenantEnable)
 	if diskMultiTenantEnable == "true" || diskMultiTenantEnable == "yes" {
-		log.Infof("Multi tenant is Enabled")
+		log.Log.Infof("Multi tenant is Enabled")
 		isDiskMultiTenantEnable = true
 	} else if diskMultiTenantEnable == "false" || diskMultiTenantEnable == "no" {
 		isDiskMultiTenantEnable = false
 	}
 
-	log.Infof("Starting with GlobalConfigVar: region(%s), NodeID(%s), ADControllerEnable(%t), DiskTagEnable(%t), DiskBdfEnable(%t), MetricEnable(%t), RunTimeClass(%s), DetachDisabled(%t), DetachBeforeDelete(%t), ClusterID(%s)", region, nodeID, isADControllerEnable, isDiskTagEnable, isDiskBdfEnable, isDiskMetricEnable, runtimeValue, isDiskDetachDisable, isDiskDetachBeforeDelete, clustID)
+	nodeMultiZoneEnable := os.Getenv(NodeMultiZoneEnable)
+	if nodeMultiZoneEnable == "true" || nodeMultiZoneEnable == "yes" {
+		log.Log.Infof("Multi zone node is Enabled")
+		isNodeMultiZoneEnable = true
+	}
+
+	delAutoSnap := false
+	volumeDelAutoSnap := os.Getenv("VOLUME_DEL_AUTO_SNAP")
+	if volumeDelAutoSnap == "true" {
+		delAutoSnap = true
+	}
+
+	log.Log.Infof("Starting with GlobalConfigVar: region(%s), zone(%s), NodeID(%s), ADControllerEnable(%t), DiskTagEnable(%t), DiskBdfEnable(%t), MetricEnable(%t), RunTimeClass(%s), DetachDisabled(%t), DetachBeforeDelete(%t), ClusterID(%s)", regionID, zoneID, nodeID, isADControllerEnable, isDiskTagEnable, isDiskBdfEnable, isDiskMetricEnable, runtimeValue, isDiskDetachDisable, isDiskDetachBeforeDelete, clustID)
 	// Global Config Set
 	GlobalConfigVar = GlobalConfig{
-		EcsClient:             client,
-		Region:                region,
+		Region:                regionID,
 		NodeID:                nodeID,
+		ZoneID:                zoneID,
 		CanAttach:             true,
 		ADControllerEnable:    isADControllerEnable,
 		DiskTagEnable:         isDiskTagEnable,
@@ -363,6 +408,11 @@ func GlobalConfigSet(client *ecs.Client, region, nodeID string) *restclient.Conf
 		ControllerService:     controllerServerType,
 		BdfHealthCheck:        bdfCheck,
 		DiskMultiTenantEnable: isDiskMultiTenantEnable,
+		NodeMultiZoneEnable:   isNodeMultiZoneEnable,
+		WaitBeforeAttach:      isWaitBeforeAttach,
+		AddonVMFatalEvents:    fatalEvents,
+		SnapshotBeforeDelete:  delAutoSnap,
+		RequestBaseInfo:       map[string]string{"owner": "alibaba-cloud-csi-driver", "nodeName": nodeName},
 	}
 	return cfg
 }

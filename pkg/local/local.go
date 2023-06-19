@@ -17,18 +17,18 @@ limitations under the License.
 package local
 
 import (
-	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-csi/drivers/pkg/csi-common"
 	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/local/types"
+	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/options"
 	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/utils"
 	log "github.com/sirupsen/logrus"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 )
@@ -203,9 +203,19 @@ func (lvm *Local) Run() {
 // GlobalConfigSet set Global Config
 func GlobalConfigSet(region, nodeID, driverName string) {
 	// Global Configs Set
-	cfg, err := clientcmd.BuildConfigFromFlags(masterURL, kubeconfig)
+	cfg, err := clientcmd.BuildConfigFromFlags(options.MasterURL, options.Kubeconfig)
 	if err != nil {
 		log.Fatalf("Error building kubeconfig: %s", err.Error())
+	}
+	if qps := os.Getenv("KUBE_CLI_API_QPS"); qps != "" {
+		if qpsi, err := strconv.Atoi(qps); err == nil {
+			cfg.QPS = float32(qpsi)
+		}
+	}
+	if burst := os.Getenv("KUBE_CLI_API_BURST"); burst != "" {
+		if qpsi, err := strconv.Atoi(burst); err == nil {
+			cfg.Burst = qpsi
+		}
 	}
 	kubeClient, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
@@ -213,57 +223,48 @@ func GlobalConfigSet(region, nodeID, driverName string) {
 	}
 
 	nodeName := os.Getenv("KUBE_NODE_NAME")
-	pmemEnable := false
-	pmeType := ""
-	nodeInfo, err := kubeClient.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
-	if err != nil {
-		log.Errorf("Describe node %s with error: %s", nodeName, err.Error())
-	} else {
-		if value, ok := nodeInfo.Labels[types.PmemNodeLable]; ok {
-			nodePmemType := strings.TrimSpace(value)
-			pmemEnable = true
-			for _, supportPmemType := range PmemSupportType {
-				if nodePmemType == supportPmemType {
-					pmeType = supportPmemType
-				}
-			}
-			if pmeType == "" {
-				log.Fatalf("GlobalConfigSet: unknown pemeType: %s", nodePmemType)
-			}
-		}
-		log.Infof("GlobalConfigSet: Describe node %s and Set PMEM to %v, %s", nodeName, pmemEnable, pmeType)
-	}
+	pmemEnable, pmeType := IsPmemSupported(nodeName, kubeClient)
 
 	grpcProvision := true
-	remoteConfig := os.Getenv("LOCAL_GRPC_PROVISION")
+	remoteConfig := os.Getenv(LOCAL_GRPC_PROVISION)
 	if strings.ToLower(remoteConfig) == "false" {
 		grpcProvision = false
 	}
 
 	hostNameAsTop := false
-	hostNameEnv := os.Getenv("LOCAL_HOSTNAME_AS_TOPO")
+	hostNameEnv := os.Getenv(LOCAL_HOSTNAME_AS_TOPO)
 	if strings.ToLower(hostNameEnv) == "true" {
 		hostNameAsTop = true
 	}
 
 	topoKeyDefine := TopologyNodeKey
-	topoKeyStr := os.Getenv("LOCAL_TOPO_KEY_DEFINED")
+	topoKeyStr := os.Getenv(LOCAL_TOPO_KEY_DEFINED)
 	if topoKeyStr != "" {
 		log.Infof("Lcoal: use special topoloy key with LOCAL_TOPO_KEY_DEFINED: %s", topoKeyStr)
 		topoKeyDefine = topoKeyStr
 	}
+	CapacityToNode := false
+	capacityToNode := os.Getenv(CAPACITY_TO_NODE)
+	if capacityToNode == "true" || capacityToNode == "yes" {
+		log.Infof("Local: CAPACITY_TO_NODE is setting: %s", capacityToNode)
+		CapacityToNode = true
+	}
 
 	// Global Config Set
 	types.GlobalConfigVar = types.GlobalConfig{
-		Region:         region,
-		NodeID:         nodeID,
-		Scheduler:      driverName,
-		PmemEnable:     pmemEnable,
-		PmemType:       pmeType,
-		GrpcProvision:  grpcProvision,
-		KubeClient:     kubeClient,
-		HostNameAsTopo: hostNameAsTop,
-		TopoKeyDefine:  topoKeyDefine,
+		Region:                  region,
+		NodeID:                  nodeID,
+		Scheduler:               driverName,
+		PmemEnable:              pmemEnable,
+		PmemType:                pmeType,
+		CapacityToNode:          CapacityToNode,
+		GrpcProvision:           grpcProvision,
+		KubeClient:              kubeClient,
+		HostNameAsTopo:          hostNameAsTop,
+		TopoKeyDefine:           topoKeyDefine,
+		LocalSparseFileDir:      os.Getenv(LOCAL_SPARSE_TEMPLATE_FILEDIR),
+		LocalSparseFileTempSize: os.Getenv(LOCAL_SPARSE_TEMPLATE_SIZE),
+		LocalSparseTotalGi:      os.Getenv(LOCAL_SPARSE_TOTAL_AVAILABLE_GI),
 	}
 	log.Infof("Local Plugin Global Config is: %v", types.GlobalConfigVar)
 }

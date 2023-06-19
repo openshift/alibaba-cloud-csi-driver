@@ -2,7 +2,7 @@ FROM registry.ci.openshift.org/ocp/builder:rhel-8-golang-1.20-openshift-4.14 AS 
 WORKDIR /go/src/github.com/kubernetes-sigs/alibaba-cloud-csi-driver
 COPY . .
 # Build the disk CSI driver binary. Do not build docker image.
-RUN build/build-all.sh noimage
+RUN build/build-all-amd.sh noimage
 
 FROM registry.ci.openshift.org/ocp/4.14:base
 # Get mkfs & blkid & pciutils

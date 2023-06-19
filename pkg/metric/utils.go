@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/cnfs/v1beta1"
@@ -28,6 +29,25 @@ var isVF = false
 
 const containerNetworkFileSystem = "containerNetworkFileSystem"
 
+func readFirstLines(path string) ([]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	if len(lines) == 0 {
+		return lines, scanner.Err()
+	}
+	lineStrArray := strings.Split(lines[0], " ")
+	return lineStrArray, scanner.Err()
+}
+
 func getPvcByPvNameByDisk(clientSet *kubernetes.Clientset, pvName string) (string, string, error) {
 	pv, err := clientSet.CoreV1().PersistentVolumes().Get(context.Background(), pvName, apismetav1.GetOptions{})
 	if err != nil {
@@ -39,7 +59,7 @@ func getPvcByPvNameByDisk(clientSet *kubernetes.Clientset, pvName string) (strin
 	return "", "", errors.New("pvName:" + pv.Name + " status is not bound.")
 }
 
-func getPvcByPvNameByNas(clientSet *kubernetes.Clientset, cnfsClient dynamic.Interface, pvName string) (string, string, string, error) {
+func getPvcByPvName(clientSet *kubernetes.Clientset, cnfsClient dynamic.Interface, pvName string) (string, string, string, error) {
 	pv, err := clientSet.CoreV1().PersistentVolumes().Get(context.Background(), pvName, apismetav1.GetOptions{})
 	if err != nil {
 		return "", "", "", err
@@ -303,4 +323,20 @@ func parseCapacityThreshold(s string, defaults float64) (float64, error) {
 		return defaults, err
 	}
 	return thresholNum, nil
+}
+
+func getGlobalMountPathByPvName(pvName string, info *diskInfo) {
+
+	result := sha256.Sum256([]byte(fmt.Sprintf("%s", info.DiskID)))
+	volSha := fmt.Sprintf("%x", result)
+
+	globalFileVer1 := filepath.Join(utils.KubeletRootDir, "/plugins/kubernetes.io/csi/pv/", pvName, "/globalmount")
+	globalFileVer2 := filepath.Join(utils.KubeletRootDir, "/plugins/kubernetes.io/csi/", diskDriverName, volSha, "/globalmount")
+
+	if utils.IsFileExisting(globalFileVer1) {
+		info.GlobalMountPath = globalFileVer1
+	} else {
+		info.GlobalMountPath = globalFileVer2
+	}
+
 }

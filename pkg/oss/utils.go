@@ -17,11 +17,13 @@ limitations under the License.
 package oss
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/utils"
 	"io/ioutil"
 	"net/http"
-	"strings"
+	"path/filepath"
+	"time"
 )
 
 const (
@@ -47,22 +49,51 @@ func GetMetaData(resource string) string {
 	return string(body)
 }
 
+func GetMetaDataAsync(resource string) string {
+	c1 := make(chan string, 1)
+	go func(r string) {
+		ans := GetMetaData(r)
+		c1 <- ans
+	}(resource)
+	select {
+	case res := <-c1:
+		return res
+	case <-time.After(2 * time.Second):
+		return ""
+	}
+}
+
+func GetGlobalMountPath(volumeId string) string {
+
+	result := sha256.Sum256([]byte(fmt.Sprintf("%s", volumeId)))
+	volSha := fmt.Sprintf("%x", result)
+
+	globalFileVer1 := filepath.Join(utils.KubeletRootDir, "/plugins/kubernetes.io/csi/pv/", volumeId, "/globalmount")
+	globalFileVer2 := filepath.Join(utils.KubeletRootDir, "/plugins/kubernetes.io/csi/", driverName, volSha, "/globalmount")
+
+	if utils.IsFileExisting(globalFileVer1) {
+		return globalFileVer1
+	} else {
+		return globalFileVer2
+	}
+}
+
 // GetRAMRoleOption get command line's ram_role option
-func GetRAMRoleOption(mntCmd string) string {
+func GetRAMRoleOption() string {
 	ramRole := GetMetaData(RAMRoleResource)
 	ramRoleOpt := MetadataURL + RAMRoleResource + ramRole
-	mntCmd = fmt.Sprintf(mntCmd+" -oram_role=%s", ramRoleOpt)
-	return mntCmd
+	mntCmdRamRole := fmt.Sprintf("-oram_role=%s", ramRoleOpt)
+	return mntCmdRamRole
 }
 
 // IsOssfsMounted return if oss mountPath is mounted
 func IsOssfsMounted(mountPath string) bool {
-	checkMountCountCmd := fmt.Sprintf("%s mount | grep %s | grep -E '%s|%s' | grep -v grep | wc -l", NsenterCmd, mountPath, OssFsType, JindoFsType)
-	out, err := utils.Run(checkMountCountCmd)
+	checkMountCountCmd := fmt.Sprintf("%s mount", NsenterCmd)
+	out, err := utils.RunWithFilter(checkMountCountCmd, mountPath, "fuse.ossfs")
 	if err != nil {
 		return false
 	}
-	if strings.TrimSpace(out) == "0" {
+	if len(out) == 0 {
 		return false
 	}
 	return true
@@ -71,10 +102,10 @@ func IsOssfsMounted(mountPath string) bool {
 // IsLastSharedVol return code status to help check if this oss volume uses UseSharedPath and is the last one
 func IsLastSharedVol(pvName string) (string, error) {
 	keyStr := fmt.Sprintf("volumes/kubernetes.io~csi/%s/mount", pvName)
-	checkMountCountCmd := fmt.Sprintf("%s mount | grep %s | grep -E '%s|%s' | grep -v grep | wc -l", NsenterCmd, keyStr, OssFsType, JindoFsType)
-	out, err := utils.Run(checkMountCountCmd)
+	checkMountCountCmd := fmt.Sprintf("%s mount", NsenterCmd)
+	out, err := utils.RunWithFilter(checkMountCountCmd, keyStr, "fuse.ossfs")
 	if err != nil {
 		return "0", err
 	}
-	return strings.TrimSpace(out), nil
+	return string(rune(len(out))), nil
 }

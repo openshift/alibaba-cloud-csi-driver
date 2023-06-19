@@ -4,6 +4,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/local/manager"
 	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/utils"
@@ -11,16 +15,12 @@ import (
 	"golang.org/x/net/context"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
-	"k8s.io/kubernetes/pkg/util/resizefs"
+	k8smount "k8s.io/mount-utils"
 	utilexec "k8s.io/utils/exec"
-	k8smount "k8s.io/utils/mount"
-	"os"
-	"path/filepath"
-	"strings"
 )
 
 // include normal lvm & aep lvm type
@@ -77,8 +77,13 @@ func (ns *nodeServer) mountLvm(ctx context.Context, req *csi.NodePublishVolumeRe
 		}
 	}
 
-	isMnt := utils.IsMounted(targetPath)
-	if !isMnt {
+	isNotMnt, err := ns.mounter.IsNotMountPoint(targetPath)
+	if err != nil {
+		log.Errorf("NodePublishVolume: check target path mounted err: %+v", err)
+		return status.Error(codes.Internal, err.Error())
+	}
+
+	if isNotMnt {
 		var options []string
 		if req.GetReadonly() {
 			options = append(options, "ro")
@@ -88,18 +93,25 @@ func (ns *nodeServer) mountLvm(ctx context.Context, req *csi.NodePublishVolumeRe
 		mountFlags := req.GetVolumeCapability().GetMount().GetMountFlags()
 		options = append(options, mountFlags...)
 
+		// Set mkfs options for ext3, ext4
+		mkfsOptions := make([]string, 0)
+		if value, ok := req.VolumeContext[MkfsOptions]; ok {
+			mkfsOptions = strings.Split(value, " ")
+		}
+
 		diskMounter := &k8smount.SafeFormatAndMount{Interface: ns.k8smounter, Exec: utilexec.New()}
-		if err := diskMounter.FormatAndMount(devicePath, targetPath, fsType, options); err != nil {
-			log.Errorf("NodeStageVolume: Volume: %s, Device: %s, FormatAndMount error: %s", req.VolumeId, devicePath, err.Error())
+
+		if err := utils.FormatAndMount(diskMounter, devicePath, targetPath, fsType, mkfsOptions, options); err != nil {
+			log.Errorf("NodePublishVolume: Volume: %s, Device: %s, FormatAndMount error: %s", req.VolumeId, devicePath, err.Error())
 			return status.Error(codes.Internal, err.Error())
 		}
 		log.Infof("NodePublishVolume:: mount successful devicePath: %s, targetPath: %s, options: %v", devicePath, targetPath, options)
 	}
 
 	// Set volume IO Limit
-	err := setVolumeIOLimit(devicePath, req)
+	err = utils.SetVolumeIOLimit(devicePath, req)
 	if err != nil {
-		log.Errorf("NodePublishVolume: Set Volume(%s) IO Limit with Error: %s", volumeID, err.Error())
+		log.Errorf("NodePublishVolume: Set LVM Volume(%s) IO Limit with Error: %s", volumeID, err.Error())
 		return status.Error(codes.Internal, err.Error())
 	}
 
@@ -193,10 +205,22 @@ func (ns *nodeServer) mountDeviceVolume(ctx context.Context, req *csi.NodePublis
 	targetPath := req.TargetPath
 	if value, ok := req.VolumeContext[DeviceVolumeType]; ok {
 		sourceDevice = value
+	} else if value, ok = req.VolumeContext[DeviceVolumeKey]; ok {
+		sourceDevice = value
 	}
 	if sourceDevice == "" {
 		log.Errorf("mountDeviceVolume: device volume: %s, sourcePath empty", req.VolumeId)
 		return status.Error(codes.Internal, "Mount Device with empty source path "+req.VolumeId)
+	}
+
+	isNotMnt, err := ns.mounter.IsNotMountPoint(targetPath)
+	if err != nil {
+		log.Errorf("mountDeviceVolume: check target path mounted err: %+v", err)
+		return status.Error(codes.Internal, err.Error())
+	}
+	if !isNotMnt {
+		log.Infof("mountDeviceVolume: Device %s Already mounted to mountpoint %s", sourceDevice, targetPath)
+		return nil
 	}
 
 	// Step Start to format
@@ -207,6 +231,7 @@ func (ns *nodeServer) mountDeviceVolume(ctx context.Context, req *csi.NodePublis
 		fsType = mnt.FsType
 	}
 
+	log.Infof("mountDeviceVolume: Starting mount device %s to mountpoint %s by fsType %s with options %v", sourceDevice, targetPath, fsType, options)
 	// do format-mount or mount
 	diskMounter := &k8smount.SafeFormatAndMount{Interface: ns.k8smounter, Exec: utilexec.New()}
 	if err := diskMounter.FormatAndMount(sourceDevice, targetPath, fsType, options); err != nil {
@@ -214,6 +239,7 @@ func (ns *nodeServer) mountDeviceVolume(ctx context.Context, req *csi.NodePublis
 		return status.Error(codes.Internal, err.Error())
 	}
 
+	log.Infof("mountDeviceVolume: Successful mount device %s to mountpoint %s by fsType %s with options %v", sourceDevice, targetPath, fsType, options)
 	return nil
 }
 
@@ -272,6 +298,48 @@ func (ns *nodeServer) mountPmemVolume(ctx context.Context, req *csi.NodePublishV
 		}
 	} else {
 		return status.Error(codes.Internal, "NodePublishVolume: direct pmem with pmemBlockDev empty"+req.VolumeId)
+	}
+	return nil
+}
+
+func (ns *nodeServer) mountLoopDeviceVolume(ctx context.Context, req *csi.NodePublishVolumeRequest, lp manager.LoopDevice) error {
+	targetPath := req.TargetPath
+
+	nodeAffinity := DefaultNodeAffinity
+	if _, ok := req.VolumeContext[NodeAffinity]; ok {
+		nodeAffinity = req.VolumeContext[NodeAffinity]
+	}
+	log.Infof("NodePublishVolume: Starting to mount loopdevice at path %s, with volume: %s, nodeaffinity: %s", targetPath, req.GetVolumeId(), nodeAffinity)
+	volumeID := req.GetVolumeId()
+	// Check target mounted
+	isMnt, err := ns.checkTargetMounted(targetPath)
+	if err != nil {
+		log.Errorf("NodePublishVolume: check volume %s is mounted err: %s", volumeID, err.Error())
+		return err
+	}
+	if !isMnt {
+		lpPath := filepath.Join(ns.SparseFileDir, fmt.Sprintf("%s.img", volumeID))
+		device, err := lp.FindLoopDeviceBySparseFile(lpPath)
+		if err != nil {
+			log.Errorf("NodePublishVolume: find loopdevice failed. err: %v", err)
+			return err
+		}
+		mountCmd := fmt.Sprintf("%s mount %s %s", NsenterCmd, device, targetPath)
+		_, err = utils.Run(mountCmd)
+		if err != nil {
+			err = fmt.Errorf("NodePublishVOlume: Volume: %s, Device: %s, mount error: %s", req.VolumeId, device, err.Error())
+			return err
+		}
+	}
+	log.Infof("NodePublishVolume: targetpath: %s is mounted", targetPath)
+
+	// upgrade PV with NodeAffinity
+	if nodeAffinity == "true" {
+		err = ns.updatePVNodeAffinity(volumeID)
+		if err != nil {
+			log.Errorf("NodePublishVolume: mount device volume %s with path %s with error: %v", req.VolumeId, targetPath, err)
+			return err
+		}
 	}
 	return nil
 }
@@ -413,15 +481,18 @@ func (ns *nodeServer) checkPmemNameSpaceResize(volumeID, targetPath string) erro
 
 	devicePath := filepath.Join("/dev", pmemBlockDev)
 	// use resizer to expand volume filesystem
-	resizer := resizefs.NewResizeFs(&k8smount.SafeFormatAndMount{Interface: ns.k8smounter, Exec: utilexec.New()})
-	ok, err := resizer.Resize(devicePath, targetPath)
+	mounter := &k8smount.SafeFormatAndMount{Interface: ns.k8smounter, Exec: utilexec.New()}
+	r := k8smount.NewResizeFs(mounter.Exec)
+	needResize, err := r.NeedResize(devicePath, targetPath)
 	if err != nil {
 		log.Errorf("NodeExpandVolume:: Lvm Resize Error, volumeId: %s, devicePath: %s, volumePath: %s, err: %s", volumeID, devicePath, targetPath, err.Error())
 		return err
 	}
-	if !ok {
-		log.Errorf("NodeExpandVolume:: Lvm Resize failed, volumeId: %s, devicePath: %s, volumePath: %s", volumeID, devicePath, targetPath)
-		return status.Error(codes.Internal, "Fail to resize volume fs")
+	if needResize {
+		log.Infof("NodeStageVolume: Resizing volume %q created from a snapshot/volume", devicePath)
+		if _, err := r.Resize(devicePath, targetPath); err != nil {
+			return err
+		}
 	}
 	log.Infof("NodeExpandVolume:: lvm resizefs successful volumeId: %s, devicePath: %s, volumePath: %s", volumeID, devicePath, targetPath)
 	return nil

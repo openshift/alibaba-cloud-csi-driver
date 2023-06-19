@@ -6,15 +6,19 @@ import (
 
 // GlobalConfig var
 type GlobalConfig struct {
-	Region         string
-	NodeID         string
-	Scheduler      string
-	PmemEnable     bool
-	PmemType       string
-	GrpcProvision  bool
-	HostNameAsTopo bool
-	TopoKeyDefine  string
-	KubeClient     *kubernetes.Clientset
+	Region                  string
+	NodeID                  string
+	Scheduler               string
+	PmemEnable              bool
+	PmemType                string
+	CapacityToNode          bool
+	GrpcProvision           bool
+	HostNameAsTopo          bool
+	TopoKeyDefine           string
+	LocalSparseFileDir      string
+	LocalSparseFileTempSize string
+	LocalSparseTotalGi      string
+	KubeClient              *kubernetes.Clientset
 }
 
 var (

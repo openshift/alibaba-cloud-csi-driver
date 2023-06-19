@@ -38,7 +38,6 @@ import (
 	"google.golang.org/grpc/status"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/clientcmd"
 )
 
 type nodeServer struct {
@@ -49,14 +48,15 @@ type nodeServer struct {
 
 // Options struct definition
 type Options struct {
-	Server    string `json:"server"`
-	Path      string `json:"path"`
-	Vers      string `json:"vers"`
-	Mode      string `json:"mode"`
-	ModeType  string `json:"modeType"`
-	Options   string `json:"options"`
-	MountType string `json:"mountType"`
-	LoopLock  string `json:"loopLock"`
+	Server        string `json:"server"`
+	Path          string `json:"path"`
+	Vers          string `json:"vers"`
+	Mode          string `json:"mode"`
+	ModeType      string `json:"modeType"`
+	Options       string `json:"options"`
+	MountType     string `json:"mountType"`
+	LoopLock      string `json:"loopLock"`
+	MountProtocol string `json:"mountProtocol"`
 }
 
 // RunvNasOptions struct definition
@@ -85,38 +85,49 @@ const (
 	RunvRunTimeMode = "runv"
 	// NasMntPoint tag
 	NasMntPoint = "/mnt/nasplugin.alibabacloud.com"
+	// MountProtocolNFS common nfs protocol
+	MountProtocolNFS = "nfs"
+	// MountProtocolCPFS common cpfs protocol
+	MountProtocolCPFSEAC = "cpfs-eac"
+	// MountProtocolCPFSNFS cpfs-nfs protocol
+	MountProtocolCPFSNFS = "cpfs-nfs"
+	// MountProtocolAliNas alinas protocal
+	MountProtocolAliNas = "alinas"
+	// MountProtocolTag tag
+	MountProtocolTag = "mountProtocol"
+
+	// metricsPathPrefix
+	metricsPathPrefix = "/host/var/run/eac/"
 )
 
 // newNodeServer create the csi node server
 func newNodeServer(d *NAS) *nodeServer {
-	cfg, err := clientcmd.BuildConfigFromFlags(masterURL, kubeconfig)
-	if err != nil {
-		log.Fatalf("Error building kubeconfig: %s", err.Error())
-	}
-	kubeClient, err := kubernetes.NewForConfig(cfg)
-	if err != nil {
-		log.Fatalf("Error building kubernetes clientset: %s", err.Error())
-	}
-
-	crdClient, err := dynamic.NewForConfig(cfg)
-	if err != nil {
-		log.Fatalf("Error building crd clientset: %s", err)
-	}
 
 	return &nodeServer{
-		clientSet:         kubeClient,
-		crdClient:         crdClient,
+		clientSet:         GlobalConfigVar.KubeClient,
+		crdClient:         GlobalConfigVar.DynamicClient,
 		DefaultNodeServer: csicommon.NewDefaultNodeServer(d.driver),
 	}
 }
 
-func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
-	log.Infof("NodePublishVolume:: Nas Volume %s Mount with: %v", req.VolumeId, req)
+func validateNodePublishVolumeRequest(req *csi.NodePublishVolumeRequest) error {
+	valid, err := utils.CheckRequest(req.GetVolumeContext(), req.GetTargetPath())
+	if !valid {
+		return status.Errorf(codes.InvalidArgument, err.Error())
+	}
+	return nil
+}
 
-	// parse parameters
+func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
+	log.Infof("NodePublishVolume:: Nas Volume %s mount with req: %+v", req.VolumeId, req)
 	mountPath := req.GetTargetPath()
+	if err := validateNodePublishVolumeRequest(req); err != nil {
+		return nil, err
+	}
+	// parse parameters
 	opt := &Options{}
 	var cnfsName string
+	var useEaClient string
 	for key, value := range req.VolumeContext {
 		key = strings.ToLower(key)
 		if key == "server" {
@@ -137,6 +148,8 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 			opt.LoopLock = value
 		} else if key == "containernetworkfilesystem" {
 			cnfsName = value
+		} else if key == strings.ToLower(MountProtocolTag) {
+			opt.MountProtocol = strings.TrimSpace(value)
 		}
 	}
 
@@ -150,12 +163,21 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		if err != nil {
 			return nil, err
 		}
-
 		opt.Server = cnfs.Status.FsAttributes.Server
+		useEaClient = cnfs.Status.FsAttributes.UseElasticAccelerationClient
+		if cnfs.Status.FsAttributes.FilesystemType == "cpfs" {
+			opt.MountProtocol = MountProtocolCPFSNFS
+			if useEaClient == "true" {
+				opt.MountProtocol = MountProtocolCPFSEAC
+			}
+		}
 	}
 
 	if opt.LoopLock != "false" {
 		opt.LoopLock = "true"
+	}
+	if opt.MountProtocol == "" {
+		opt.MountProtocol = MountProtocolNFS
 	}
 
 	// version/options used first in mountOptions
@@ -195,8 +217,8 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 			runvOptions.RunTime = "runv"
 			runvOptions.VolumeType = "nfs"
 			runvOptions.MountFile = fileName
-			if err := utils.WriteJosnFile(runvOptions, fileName); err != nil {
-				return nil, errors.New("NodePublishVolume: Write Josn File error: " + err.Error())
+			if err := utils.WriteJSONFile(runvOptions, fileName); err != nil {
+				return nil, errors.New("NodePublishVolume: Write Json File error: " + err.Error())
 			}
 			log.Infof("Nas(Kata), Write Nfs Options to File Successful: %s", fileName)
 			return &csi.NodePublishVolumeResponse{}, nil
@@ -211,17 +233,23 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		return nil, errors.New("host is empty, should input nas domain")
 	}
 	// check network connection
-	conn, err := net.DialTimeout("tcp", opt.Server+":"+NasPortnum, time.Second*time.Duration(3))
-	if err != nil {
-		log.Errorf("NAS: Cannot connect to nas host: %s", opt.Server)
-		return nil, errors.New("NAS: Cannot connect to nas host: " + opt.Server)
+	doNfsPortCheck := GlobalConfigVar.NasPortCheck
+	if opt.MountType == SkipMountType {
+		doNfsPortCheck = false
 	}
-	defer conn.Close()
+	if (opt.MountProtocol == MountProtocolNFS || opt.MountProtocol == MountProtocolAliNas) && doNfsPortCheck {
+		conn, err := net.DialTimeout("tcp", opt.Server+":"+NasPortnum, time.Second*time.Duration(30))
+		if err != nil {
+			log.Errorf("NAS: Cannot connect to nas host: %s", opt.Server)
+			return nil, errors.New("NAS: Cannot connect to nas host: " + opt.Server)
+		}
+		defer conn.Close()
+	}
 
 	if opt.Path == "" {
 		opt.Path = "/"
 	}
-	// remove / if path end with /;
+	// if path end with /, remove /;
 	if opt.Path != "/" && strings.HasSuffix(opt.Path, "/") {
 		opt.Path = opt.Path[0 : len(opt.Path)-1]
 	}
@@ -259,7 +287,20 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 
 	// Create Mount Path
 	if err := utils.CreateDest(mountPath); err != nil {
-		return nil, errors.New("Nas, Mount error with create Path fail: " + mountPath)
+		return nil, errors.New("Create mount path is failed, mountPath: " + mountPath + ", err:" + err.Error())
+	}
+
+	// if volume set mountType as skipmount;
+	if opt.MountType == SkipMountType {
+		mountCmd := fmt.Sprintf("mount -t tmpfs -o size=1m tmpfs %s", mountPath)
+		_, err := utils.ValidateRun(mountCmd)
+		if err != nil {
+			log.Errorf("NAS: Mount volume(%s) path as tmpfs with err: %v", req.VolumeId, err.Error())
+			return nil, status.Error(codes.Internal, "NAS: Mount as tmpfs volume with err"+err.Error())
+		}
+		saveVolumeData(opt, mountPath)
+		log.Infof("NodePublishVolume:: Volume %s is Skip Mount type, just save the metadata: %s", req.VolumeId, mountPath)
+		return &csi.NodePublishVolumeResponse{}, nil
 	}
 
 	// do losetup nas logical
@@ -280,12 +321,38 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	// if system not set nas, config it.
 	checkSystemNasConfig()
 
-	// Do mount
-	if err := DoNfsMount(opt.Server, opt.Path, opt.Vers, opt.Options, mountPath, req.VolumeId); err != nil {
-		log.Errorf("Nas, Mount Nfs error: %s", err.Error())
-		return nil, errors.New("Nas, Mount Nfs error: %s" + err.Error())
+	//cpfs-nfs check valid
+	if opt.MountProtocol == MountProtocolCPFSNFS || opt.MountProtocol == MountProtocolCPFSEAC {
+		if !strings.HasPrefix(opt.Path, "/share") {
+			return nil, errors.New("The cpfs2.0 mount path must start with /share.")
+		}
 	}
 
+	// Do mount
+	podUID := req.VolumeContext["csi.storage.k8s.io/pod.uid"]
+	if podUID == "" {
+		log.Errorf("Volume(%s) Cannot get poduid and cannot set volume limit", req.VolumeId)
+		return nil, errors.New("Cannot get poduid and cannot set volume limit: " + req.VolumeId)
+	}
+	//mount nas client
+	if err := DoMount(opt.MountProtocol, opt.Server, opt.Path, opt.Vers, opt.Options, mountPath, req.VolumeId, podUID, useEaClient); err != nil {
+		log.Errorf("Nas, Mount Nfs error: %s", err.Error())
+		return nil, errors.New("Nas, Mount Nfs error:" + err.Error())
+	}
+	if useEaClient == "true" {
+		if strings.Contains(opt.Server, ".nas.aliyuncs.com") {
+			fsID := GetFsIDByNasServer(opt.Server)
+			if len(fsID) != 0 {
+				utils.WriteMetricsInfo(metricsPathPrefix, req, "10", "eac", "nas", fsID)
+			}
+		} else {
+			fsID := GetFsIDByCpfsServer(opt.Server)
+			if len(fsID) != 0 {
+				utils.WriteMetricsInfo(metricsPathPrefix, req, "10", "eac", "cpfs", fsID)
+			}
+		}
+
+	}
 	// change the mode
 	if opt.Mode != "" && opt.Path != "/" {
 		var wg1 sync.WaitGroup
@@ -296,7 +363,7 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 			if opt.ModeType == "recursive" {
 				cmd = fmt.Sprintf("chmod -R %s %s", opt.Mode, mountPath)
 			}
-			if _, err := utils.Run(cmd); err != nil {
+			if _, err := utils.ValidateRun(cmd); err != nil {
 				log.Errorf("Nas chmod cmd fail: %s %s", cmd, err)
 			} else {
 				log.Infof("Nas chmod cmd success: %s", cmd)
@@ -313,13 +380,27 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	if !utils.IsMounted(mountPath) {
 		return nil, errors.New("Check mount fail after mount:" + mountPath)
 	}
+
+	saveVolumeData(opt, mountPath)
 	log.Infof("NodePublishVolume:: Volume %s Mount success on mountpoint: %s", req.VolumeId, mountPath)
 
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
+func validateNodeUnpublishVolumeRequest(req *csi.NodeUnpublishVolumeRequest) error {
+	valid, err := utils.ValidatePath(req.GetTargetPath())
+	if !valid {
+		return status.Errorf(codes.InvalidArgument, err.Error())
+	}
+	return nil
+}
+
 func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
-	log.Infof("NodeUnpublishVolume:: Starting Umount Nas Volume %s at path %s", req.VolumeId, req.TargetPath)
+	log.Infof("NodeUnpublishVolume:: Starting umount nas volume %s with req: %+v", req.VolumeId, req)
+	err := validateNodeUnpublishVolumeRequest(req)
+	if err != nil {
+		return nil, err
+	}
 	// check runtime mode
 	if GlobalConfigVar.RunTimeClass == MixRunTimeMode && utils.IsMountPointRunv(req.TargetPath) {
 		fileName := filepath.Join(req.TargetPath, utils.CsiPluginRunTimeFlagFile)
@@ -333,11 +414,11 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 	mountPoint := req.TargetPath
 	isNotMounted, err := utils.IsLikelyNotMountPoint(mountPoint)
 	if (isNotMounted && err == nil) || os.IsNotExist(err) {
-		log.Infof("Umount Nas: mountpoint not mounted, skipping: %s", mountPoint)
+		log.Infof("Umount mountpoint %s is not mounted, skipping.", mountPoint)
 		if GlobalConfigVar.LosetupEnable {
 			if err := checkLosetupUnmount(mountPoint); err != nil {
-				log.Errorf("Nas: check and umount lostup volume with error: %v", err)
-				return nil, errors.New("Nas, check Losetup Unmount Fail: " + err.Error())
+				log.Errorf("Check and umount losetup volume is failed, err: %v", err)
+				return nil, errors.New("Check ans umount losetup is failed: " + err.Error())
 			}
 		}
 		return &csi.NodeUnpublishVolumeResponse{}, nil
@@ -345,18 +426,19 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 
 	umntCmd := fmt.Sprintf("umount %s", mountPoint)
 	if _, err := utils.Run(umntCmd); err != nil {
-		log.Errorf("Nas, Umount nfs(%s) Fail: %s", mountPoint, err.Error())
-		return nil, errors.New("Nas, Umount nfs Fail: " + err.Error())
+		msg := fmt.Sprintf("Umount nfs %s is failed, err: %s", mountPoint, err.Error())
+		log.Error(msg)
+		return nil, errors.New(msg)
 	}
 
 	if GlobalConfigVar.LosetupEnable {
 		if err := checkLosetupUnmount(mountPoint); err != nil {
 			log.Errorf("Nas: umount lostup volume with error: %v", err)
-			return nil, errors.New("Nas, check Losetup Unmount Fail: " + err.Error())
+			return nil, errors.New("Check umount losetup is failed, err: " + err.Error())
 		}
 	}
 
-	log.Infof("Umount Nas Successful on: %s", mountPoint)
+	log.Infof("Umount %s is successfully.", mountPoint)
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
@@ -412,13 +494,16 @@ func (ns *nodeServer) LosetupExpandVolume(req *csi.NodeExpandVolumeRequest) erro
 			log.Errorf("NodeExpandVolume: nas resize img file error %v", err)
 			return fmt.Errorf("NodeExpandVolume: nas resize img file error, %v", err)
 		}
-		loopCmd := fmt.Sprintf("%s losetup | grep -v grep | grep %s | awk '{print $1}'", NsenterCmd, imgFile)
-		out, err := utils.Run(loopCmd)
+		loopCmd := fmt.Sprintf("%s losetup", NsenterCmd)
+		stdout, err := utils.RunWithFilter(loopCmd, imgFile)
 		if err != nil {
 			log.Errorf("NodeExpandVolume: search losetup device error %v", err)
 			return fmt.Errorf("NodeExpandVolume: search losetup device error, %v", err)
 		}
-		loopDev := strings.TrimSpace(out)
+		if len(stdout) == 0 {
+			return fmt.Errorf("Not found this losetup device %s", imgFile)
+		}
+		loopDev := strings.Split(strings.TrimSpace(stdout[0]), " ")[0]
 		// Check parameter validate
 		if !utils.CheckParameterValidate([]string{loopDev}) {
 			return fmt.Errorf("inputs illegal: %s ", loopDev)

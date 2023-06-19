@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+	http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -24,7 +24,7 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestDoNfsMount(t *testing.T) {
+func TestDoMount(t *testing.T) {
 
 	nfsServer := "0.0.0.0"
 	nfsPath := "/test"
@@ -32,7 +32,7 @@ func TestDoNfsMount(t *testing.T) {
 	mountOptions := ""
 	mountPoint := ".tmp"
 	volumeID := "testtsettest"
-	err := DoNfsMount(nfsServer, nfsPath, nfsVers, mountOptions, mountPoint, volumeID)
+	err := DoMount(MountProtocolNFS, nfsServer, nfsPath, nfsVers, mountOptions, mountPoint, volumeID, "podUID", "false")
 	assert.NotNil(t, err)
 
 }
@@ -40,10 +40,9 @@ func TestDoNfsMount(t *testing.T) {
 func TestCheckNfsPathMounted(t *testing.T) {
 
 	mountPoint := "/data"
-	server := "0.0.0.0"
 	path := "tmp"
 
-	result := CheckNfsPathMounted(mountPoint, server, path)
+	result := CheckNfsPathMounted(mountPoint, path)
 	assert.False(t, result)
 
 }

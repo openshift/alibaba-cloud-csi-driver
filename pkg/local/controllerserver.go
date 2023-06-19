@@ -56,10 +56,14 @@ const (
 	PmemVolumeType = "PMEM"
 	// QuotaPathVolumeType ...
 	QuotaPathVolumeType = "QuotaPath"
+	// LoopDeviceVolumeType type defines user want to use loopdevice local disk
+	LoopDeviceVolumeType = "LoopDevice"
 	// MountPointType type
 	MountPointType = "MountPoint"
 	// DeviceVolumeType type
 	DeviceVolumeType = "Device"
+	// DeviceVolumeKey type
+	DeviceVolumeKey = "device"
 	// VolumeTypeKey volume type key words
 	VolumeTypeKey = "volumeType"
 	// connection timeout
@@ -89,14 +93,13 @@ const (
 // the map of req.Name and csi.Volume
 var createdVolumeMap = map[string]*csi.Volume{}
 
-var supportVolumeTypes = []string{LvmVolumeType, PmemVolumeType, QuotaPathVolumeType, MountPointType, DeviceVolumeType}
+var supportVolumeTypes = []string{LvmVolumeType, PmemVolumeType, QuotaPathVolumeType, MountPointType, DeviceVolumeType, LoopDeviceVolumeType}
 
 // newControllerServer creates a controllerServer object
 func newControllerServer(d *csicommon.CSIDriver, caCertFile string, clientCertFile string, clientKeyFile string) *controllerServer {
-	kubeClient := newKubeClient()
 	return &controllerServer{
 		DefaultControllerServer: csicommon.NewDefaultControllerServer(d),
-		client:                  kubeClient,
+		client:                  types.GlobalConfigVar.KubeClient,
 		caCertFile:              caCertFile,
 		clientCertFile:          clientCertFile,
 		clientKeyFile:           clientKeyFile,
@@ -122,6 +125,13 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	volumeID := req.GetName()
 	response := &csi.CreateVolumeResponse{}
 	parameters := req.GetParameters()
+
+	if valid, err := utils.ValidateRequest(parameters); !valid {
+		msg := fmt.Sprintf("CreateVolume: failed to check request args: %v", err)
+		log.Infof(msg)
+		return nil, status.Error(codes.InvalidArgument, msg)
+	}
+
 	if value, ok := parameters[VolumeTypeKey]; ok {
 		for _, supportVolType := range supportVolumeTypes {
 			if supportVolType == value {
@@ -131,7 +141,7 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	}
 	if volumeType == "" {
 		log.Errorf("CreateVolume: Create volume %s with error volumeType %v", volumeID, parameters)
-		return nil, status.Error(codes.InvalidArgument, "Local driver only support LVM/MountPoint/Device/PmemDirect/PmemQuotaPath volume type, no "+volumeType)
+		return nil, status.Error(codes.InvalidArgument, "Local driver only support LVM/MountPoint/Device/PmemDirect/PmemQuotaPath/LoopDevice volume type, no "+volumeType)
 	}
 
 	if value, ok := createdVolumeMap[req.Name]; ok {
@@ -271,7 +281,7 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		if storageSelected != "" && nodeSelected != "" {
 			paraList, err = deviceScheduled(storageSelected, parameters)
 			if err != nil {
-				log.Errorf("CreateVolume: create device volume %s/%s at node %s error: %s", storageSelected, req.Name, nodeSelected, err.Error())
+				log.Errorf("CreateVolume: create device volume %s with device %s at node %s error: %s", req.Name, storageSelected, nodeSelected, err.Error())
 				return nil, status.Error(codes.InvalidArgument, "Parse Device all scheduled info error "+err.Error())
 			}
 		} else if nodeSelected != "" {
@@ -367,6 +377,28 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 			return nil, errors.New("CreateVolume: QuotaPath type nodeselected must not be None")
 		}
 		log.Infof("CreateVolume: Successful Create QuotaPath volume %s at node %s", req.Name, nodeSelected)
+	case LoopDeviceVolumeType:
+		if nodeSelected != "" {
+			conn, err := cs.getNodeConn(nodeSelected, cs.caCertFile, cs.clientCertFile, cs.clientKeyFile)
+			if err != nil {
+				log.Errorf("CreateVolume: New loop device volume %s Connection node %s with error: %s", req.Name, nodeSelected, err.Error())
+				return nil, err
+			}
+			defer conn.Close()
+			size := fmt.Sprintf("%d", req.GetCapacityRange().GetRequiredBytes())
+
+			log.Infof("CreateVolume: create loopdevice type volume %s with node(%s), size(%s)B", req.Name, nodeSelected, size)
+			loopDevicePath, err := conn.CreateLoopDevice(ctx, req.Name, size)
+			if err != nil {
+				log.Errorf("CreateVolume: create loopdevice %s at node %s with error: %s", req.Name, nodeSelected, err.Error())
+				return nil, err
+			}
+			parameters[LoopDeviceFullPath] = loopDevicePath
+		} else {
+			log.Errorf("CreateVolume: loopdevice type volume nodeselected must not be None: %s", req.Name)
+			return nil, errors.New("CreateVolume: loopdeivce type nodeselected must not be None")
+		}
+		log.Infof("CreateVolume: Successful Create LoopDevice volume %s at node %s", req.Name, nodeSelected)
 	default:
 		log.Errorf("CreateVolume: Create with no support volume type %s", volumeType)
 		return nil, status.Error(codes.InvalidArgument, "Create with no support type "+volumeType)
@@ -439,6 +471,10 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 	volumeType := ""
 	if value, ok := pvObj.Spec.CSI.VolumeAttributes[VolumeTypeKey]; ok {
 		volumeType = value
+	}
+	if validate, err := utils.ValidateRequest(pvObj.Spec.CSI.VolumeAttributes); !validate {
+		log.Errorf("DeleteVolume: pv volumeAttributes invalid, err: %v", err)
+		return nil, err
 	}
 
 	switch volumeType {
@@ -581,9 +617,33 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 			log.Errorf("DeleteVolume: delete quotapath volume without nodeAffinity %s", volumeID)
 			return nil, fmt.Errorf("DeleteVolume: delete quotapath volume without nodeAffinity %s", volumeID)
 		}
+	case LoopDeviceVolumeType:
+		if nodeName != "" {
+			conn, err := cs.getNodeConn(nodeName, cs.caCertFile, cs.clientCertFile, cs.clientKeyFile)
+			if err != nil {
+				log.Errorf("DeleteVolume: get loopdevice volume %s Connection at node %s with error: %s", req.VolumeId, nodeName, err.Error())
+				return nil, err
+			}
+			defer conn.Close()
+
+			if _, ok := pvObj.Spec.CSI.VolumeAttributes[LoopDeviceFullPath]; !ok {
+				log.Errorf("DeleteVolume: LoopDevice volume %s not have loopDeviceFullPath parameter", req.VolumeId)
+				return nil, fmt.Errorf("DeleteVolume: loopdevice volume %s not have loopDeviceFullPath parameter", req.VolumeId)
+			}
+			loopdevicePath := pvObj.Spec.CSI.VolumeAttributes[LoopDeviceFullPath]
+			log.Errorf("DeleteVolume: LoopDevice volume associated with devices: %s", loopdevicePath)
+			_, err = conn.DeleteLoopDevice(ctx, pvObj.Name)
+			if err != nil {
+				log.Errorf("DeleteVolume: Delete loopdevice volume %s at node %s with error %s", req.VolumeId, nodeName, err.Error())
+				return nil, err
+			}
+		} else {
+			log.Errorf("DeleteVolume: delete loopdevice volume without nodeAffinity %s", volumeID)
+			return nil, fmt.Errorf("DeleteVolume: delete loopdevice volume without nodeAffinity %s", volumeID)
+		}
 	default:
 		log.Errorf("DeleteVolume: volumeType %s not supported %s", volumeType, volumeID)
-		return nil, status.Error(codes.InvalidArgument, "Local driver only support LVM volume type, no "+volumeType)
+		return nil, status.Error(codes.InvalidArgument, "Local driver only support LVM/MountPoint/Device/PmemDirect/PmemQuotaPath/LoopDevice volume type, no "+volumeType)
 	}
 	delete(createdVolumeMap, req.VolumeId)
 	log.Infof("DeleteVolume: successful delete local volume %s", volumeID)

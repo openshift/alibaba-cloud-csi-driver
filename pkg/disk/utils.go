@@ -35,6 +35,8 @@ import (
 	"time"
 	"unicode"
 
+	v1 "k8s.io/api/core/v1"
+
 	aliyunep "github.com/aliyun/alibaba-cloud-sdk-go/sdk/endpoints"
 	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/requests"
 	"github.com/aliyun/alibaba-cloud-sdk-go/services/ecs"
@@ -42,103 +44,20 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/containerd/ttrpc"
 	"github.com/golang/protobuf/ptypes/timestamp"
+	volumeSnapshotV1 "github.com/kubernetes-csi/external-snapshotter/client/v4/apis/volumesnapshot/v1"
+	snapClientset "github.com/kubernetes-csi/external-snapshotter/client/v4/clientset/versioned"
 	proto "github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/disk/proto"
+	log "github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/log"
 	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/utils"
 	perrors "github.com/pkg/errors"
-	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/kubernetes/pkg/volume/util/fs"
 	k8smount "k8s.io/mount-utils"
 	utilexec "k8s.io/utils/exec"
-)
-
-const (
-	// KubernetesAlicloudDiskDriver driver name
-	KubernetesAlicloudDiskDriver = "alicloud/disk"
-	// MetadataURL metadata URL
-	MetadataURL = "http://100.100.100.200/latest/meta-data/"
-	// DocumentURL document URL
-	DocumentURL = "http://100.100.100.200/latest/dynamic/instance-identity/document"
-	// RegionIDTag region ID
-	RegionIDTag = "region-id"
-	// InstanceID instance ID
-	InstanceID = "instance-id"
-	// DiskConflict invalid operation type
-	DiskConflict = "InvalidOperation.Conflict"
-	// IncorrectDiskStatus incorrect disk status
-	IncorrectDiskStatus = "IncorrectDiskStatus"
-	// DiskCreatingSnapshot ...
-	DiskCreatingSnapshot = "DiskCreatingSnapshot"
-	// UserNotInTheWhiteList tag
-	UserNotInTheWhiteList = "UserNotInTheWhiteList"
-	// TagK8sPV tag
-	TagK8sPV = "k8s-pv"
-	// ZoneIDTag tag
-	ZoneIDTag = "zone-id"
-	// LogfilePrefix tag
-	LogfilePrefix = "/var/log/alicloud/provisioner"
-	// DiskNotAvailable tag
-	DiskNotAvailable = "InvalidDataDiskCategory.NotSupported"
-	// DiskNotAvailableVer2 tag
-	DiskNotAvailableVer2 = "'DataDisk.n.Category' is not valid in this region."
-	// DiskSizeNotAvailable tag
-	DiskSizeNotAvailable = "InvalidDiskSize.NotSupported"
-	// DiskLimitExceeded tag
-	DiskLimitExceeded = "InstanceDiskLimitExceeded"
-	// NotSupportDiskCategory tag
-	NotSupportDiskCategory = "NotSupportDiskCategory"
-	// DiskNotPortable tag
-	DiskNotPortable = "DiskNotPortable"
-	// DiskHighAvail tag
-	DiskHighAvail = "available"
-	// DiskCommon common disk type
-	DiskCommon = "cloud"
-	// DiskEfficiency efficiency disk type
-	DiskEfficiency = "cloud_efficiency"
-	// DiskSSD ssd disk type
-	DiskSSD = "cloud_ssd"
-	// DiskESSD essd disk type
-	DiskESSD = "cloud_essd"
-	// DiskSharedSSD shared sdd disk type
-	DiskSharedSSD = "san_ssd"
-	// DiskSharedEfficiency shared efficiency disk type
-	DiskSharedEfficiency = "san_efficiency"
-	// MBSIZE tag
-	MBSIZE = 1024 * 1024
-	// GBSIZE tag
-	GBSIZE = 1024 * MBSIZE
-	// DefaultRegion is the default region id
-	DefaultRegion = "cn-hangzhou"
-	// fsckErrorsCorrected tag
-	fsckErrorsCorrected = 1
-	// fsckErrorsUncorrected tag
-	fsckErrorsUncorrected = 4
-	// DiskUUIDPath tag
-	DiskUUIDPath = "/host/etc/kubernetes/volumes/disk/uuid"
-	// ZoneID ...
-	ZoneID = "zoneId"
-	// instanceTypeLabel ...
-	instanceTypeLabel = "beta.kubernetes.io/instance-type"
-	// zoneIDLabel ...
-	zoneIDLabel = "failure-domain.beta.kubernetes.io/zone"
-	// nodeStorageLabel ...
-	nodeStorageLabel = "node.csi.alibabacloud.com/disktype.%s"
-	// kubeNodeName ...
-	kubeNodeName = "KUBE_NODE_NAME"
-	// describeResourceType ...
-	describeResourceType = "DataDisk"
-	// NodeSchedueTag in annotations
-	NodeSchedueTag = "volume.kubernetes.io/selected-node"
-	// RetryMaxTimes ...
-	RetryMaxTimes = 5
-	// RemoteSnapshotLabelKey ...
-	RemoteSnapshotLabelKey = "csi.alibabacloud.com/snapshot.targetregion"
-	// SnapshotVolumeKey ...
-	SnapshotVolumeKey = "csi.alibabacloud.com/snapshot.volumeid"
 )
 
 var (
@@ -148,10 +67,11 @@ var (
 	GITCOMMIT = "HEAD"
 	// KubernetesAlicloudIdentity is the system identity for ecs client request
 	KubernetesAlicloudIdentity = fmt.Sprintf("Kubernetes.Alicloud/CsiProvision.Disk-%s", VERSION)
-	// AvaliableDiskTypes ...
-	AvaliableDiskTypes = []string{DiskCommon, DiskESSD, DiskEfficiency, DiskSSD, DiskSharedSSD, DiskSharedEfficiency}
+	// AvailableDiskTypes ...
+	AvailableDiskTypes = []string{DiskCommon, DiskESSD, DiskEfficiency, DiskSSD, DiskSharedSSD, DiskSharedEfficiency, DiskPPerf, DiskSPerf, DiskESSDAuto}
 	// CustomDiskTypes ...
-	CustomDiskTypes = map[string]int{DiskESSD: 0, DiskSSD: 1, DiskEfficiency: 2}
+	CustomDiskTypes       = map[string]int{DiskESSD: 0, DiskSSD: 1, DiskEfficiency: 2, DiskPPerf: 3, DiskSPerf: 4, DiskESSDAuto: 5}
+	CustomDiskPerfermance = map[string]string{DISK_PERFORMANCE_LEVEL0: "", DISK_PERFORMANCE_LEVEL1: "", DISK_PERFORMANCE_LEVEL2: "", DISK_PERFORMANCE_LEVEL3: ""}
 )
 
 // DefaultOptions is the struct for access key
@@ -185,6 +105,12 @@ func newEcsClient(ac utils.AccessControl) (ecsClient *ecs.Client) {
 	default:
 		ecsClient, err = ecs.NewClientWithStsToken(regionID, ac.AccessKeyID, ac.AccessKeySecret, ac.StsToken)
 	}
+	scheme := "HTTPS"
+	if os.Getenv("ALICLOUD_CLIENT_SCHEME") == "HTTP" {
+		scheme = "HTTP"
+	}
+	ecsClient.SetHTTPSInsecure(false)
+	ecsClient.GetConfig().WithScheme(scheme)
 	if err != nil {
 		return nil
 	}
@@ -204,7 +130,7 @@ func newEcsClient(ac utils.AccessControl) (ecsClient *ecs.Client) {
 
 func updateEcsClient(client *ecs.Client) *ecs.Client {
 	ac := utils.GetAccessControl()
-	if ac.UseMode == utils.EcsRAMRole || ac.UseMode == utils.ManagedToken {
+	if ac.UseMode == utils.EcsRAMRole || ac.UseMode == utils.ManagedToken || ac.UseMode == utils.OIDCToken {
 		client = newEcsClient(ac)
 	}
 	if client.Client.GetConfig() != nil {
@@ -361,6 +287,20 @@ type instanceDocument struct {
 	ZoneID     string `json:"zone-id"`
 }
 
+func retryGetInstanceDoc() (*instanceDocument, error) {
+	var err error
+	var doc *instanceDocument
+	for i := 0; i < utils.MetadataMaxRetrycount; i++ {
+		doc, err = getInstanceDoc()
+		if err != nil {
+			log.Log.Errorf("retryGetInstanceDoc: failed to get instance doc for %v try, err: %v", i, err)
+			continue
+		}
+		return doc, nil
+	}
+	return doc, err
+}
+
 func getInstanceDoc() (*instanceDocument, error) {
 	resp, err := http.Get(DocumentURL)
 	if err != nil {
@@ -394,7 +334,7 @@ func GetDeviceByBdf(bdf string, enLog bool) (device string, err error) {
 		}
 	}
 	if enLog {
-		log.Infof("Device bdf: %s, virtio numbers: %v", bdf, virtioNumbers)
+		log.Log.Infof("Device bdf: %s, virtio numbers: %v", bdf, virtioNumbers)
 	}
 	if len(virtioNumbers) == 0 {
 		return "", fmt.Errorf("virtio device not found, bdf: %s", bdf)
@@ -411,7 +351,7 @@ func GetDeviceByBdf(bdf string, enLog bool) (device string, err error) {
 		if filepath.Base(targetPath) == virtioNumbers[0] {
 			devicePath := fmt.Sprintf("/dev/%s", filepath.Base(filepath.Dir(device)))
 			if enLog {
-				log.Infof("Device bdf: %s, device: %s", bdf, devicePath)
+				log.Log.Infof("Device bdf: %s, device: %s", bdf, devicePath)
 			}
 			return devicePath, nil
 		}
@@ -422,14 +362,14 @@ func GetDeviceByBdf(bdf string, enLog bool) (device string, err error) {
 func getDeviceSerial(serial string) (device string) {
 	serialFiles, err := filepath.Glob("/sys/block/*/serial")
 	if err != nil {
-		log.Infof("List device serial failed: %v", err)
+		log.Log.Infof("List device serial failed: %v", err)
 		return ""
 	}
 
 	for _, serialFile := range serialFiles {
 		body, err := ioutil.ReadFile(serialFile)
 		if err != nil {
-			log.Errorf("Read serial(%s): %v", serialFile, err)
+			log.Log.Errorf("Read serial(%s): %v", serialFile, err)
 			continue
 		}
 		if strings.TrimSpace(string(body)) == serial {
@@ -440,37 +380,33 @@ func getDeviceSerial(serial string) (device string) {
 }
 
 // if device has no partition, just return;
-// if device has one partition, return the partition;
+// if device has one partition, return the multi partition;
 // if device has more than one partition, return error;
-func adaptDevicePartition(devicePath string) (string, error) {
+func adaptDevicePartition(devicePath string) ([]string, error) {
 	// check disk partition is enabled.
 	if !GlobalConfigVar.DiskPartitionEnable {
-		return devicePath, nil
+		return []string{devicePath}, nil
 	}
 	if devicePath == "" || !strings.HasPrefix(devicePath, "/dev/") {
-		return "", fmt.Errorf("DevicePath is empty or format error %s", devicePath)
+		return []string{}, fmt.Errorf("DevicePath is empty or format error %s", devicePath)
 	}
 
-	// check disk is partition or not
-	isPartation := false
 	// example: /dev/vdb
 	rootDevicePath := ""
-	// example: /dev/vdb1
-	subDevicePath := ""
 	// device rootPath and partitions
 	deviceList := []string{}
 
 	// Get RootDevice path
 	tmpRootPath, _, err := getDeviceRootAndIndex(devicePath)
 	if err != nil {
-		return "", err
+		return deviceList, err
 	}
 	rootDevicePath = tmpRootPath
 
 	// Get all device path relate to root device
 	globDevices, err := filepath.Glob(rootDevicePath + "*")
 	if err != nil {
-		return "", fmt.Errorf("Get Device List by Glob for %s with error %v ", devicePath, err)
+		return deviceList, fmt.Errorf("Get Device List by Glob for %s with error %v ", devicePath, err)
 	}
 	digitPattern := "^(\\d+)$"
 	for _, tmpDevice := range globDevices {
@@ -482,10 +418,25 @@ func adaptDevicePartition(devicePath string) (string, error) {
 		}
 	}
 
-	// set isPartation and check partition
+	return deviceList, nil
+
+}
+
+// GetRootSubDevicePath ...
+func GetRootSubDevicePath(deviceList []string) (rootDevicePath, subDevicePath string, err error) {
+
 	if len(deviceList) == 0 {
-		return "", fmt.Errorf("List Device Path empty for %s and globDevices with %v ", devicePath, globDevices)
-	} else if len(deviceList) == 1 {
+		return "", "", fmt.Errorf("List Device Path empty for %v", deviceList)
+	}
+	// Get RootDevice path
+	rootDevicePath, _, err = getDeviceRootAndIndex(deviceList[0])
+	if err != nil {
+		return "", "", err
+	}
+	// check disk is partition or not
+	isPartation := false
+	// set isPartation and check partition
+	if len(deviceList) == 1 {
 		isPartation = false
 	} else if len(deviceList) == 2 {
 		isPartation = true
@@ -495,16 +446,23 @@ func adaptDevicePartition(devicePath string) (string, error) {
 			subDevicePath = deviceList[0]
 		}
 	} else if len(deviceList) > 2 {
-		return "", fmt.Errorf("Device %s has more than 1 partition: %v, globDevices %v ", devicePath, deviceList, globDevices)
+		return "", "", fmt.Errorf("Devices %s has more than 1 partition", deviceList)
 	}
 
 	if isPartation == true {
 		if err := checkRootAndSubDeviceFS(rootDevicePath, subDevicePath); err != nil {
-			return "", err
+			return "", "", err
 		}
-		devicePath = subDevicePath
+		return rootDevicePath, subDevicePath, nil
 	}
-	return devicePath, nil
+	return rootDevicePath, "", nil
+}
+
+func ChooseDevice(rootDevice, subDevice string) string {
+	if subDevice != "" {
+		return subDevice
+	}
+	return rootDevice
 }
 
 func checkRootAndSubDeviceFS(rootDevicePath, subDevicePath string) error {
@@ -601,7 +559,7 @@ func GetDiskFormat(disk string) (string, string, error) {
 				return "", "", nil
 			}
 		}
-		log.Errorf("Could not determine if disk %q is formatted (%v)", disk, err)
+		log.Log.Errorf("Could not determine if disk %q is formatted (%v)", disk, err)
 		return "", "", err
 	}
 
@@ -646,13 +604,13 @@ func getNvmeDeviceByVolumeID(volumeID string) (device string, err error) {
 			cmd := fmt.Sprintf("%s udevadm info --query=all --name=/dev/%s | grep ID_SERIAL_SHORT | awk -F= '{print $2}'", NsenterCmd, f.Name())
 			snumber, err := utils.Run(cmd)
 			if err != nil {
-				log.Warnf("GetNvmeDeviceByVolumeID: Get device with command %s and got error: %s", cmd, err.Error())
+				log.Log.Warnf("GetNvmeDeviceByVolumeID: Get device with command %s and got error: %s", cmd, err.Error())
 				continue
 			}
 			snumber = strings.TrimSpace(snumber)
 			if serialNumber == strings.TrimSpace(snumber) {
 				device = filepath.Join("/dev/", f.Name())
-				log.Infof("GetNvmeDeviceByVolumeID: Get nvme device %s with volumeID %s", device, volumeID)
+				log.Log.Infof("GetNvmeDeviceByVolumeID: Get nvme device %s with volumeID %s", device, volumeID)
 				return device, nil
 			}
 		}
@@ -663,24 +621,24 @@ func getNvmeDeviceByVolumeID(volumeID string) (device string, err error) {
 // GetDeviceByVolumeID First try to find the device by serial
 // If cannot find the device using the serial number, get device by volumeID, link file should be like:
 // /dev/disk/by-id/virtio-wz9cu3ctp6aj1iagco4h -> ../../vdc
-func GetDeviceByVolumeID(volumeID string) (device string, err error) {
+func GetDeviceByVolumeID(volumeID string) (devices []string, err error) {
 	// this is danger in Bdf mode
 	if !IsVFNode() {
-		device = getDeviceSerial(strings.TrimPrefix(volumeID, "d-"))
+		device := getDeviceSerial(strings.TrimPrefix(volumeID, "d-"))
 		if device != "" {
-			if device, err = adaptDevicePartition(device); err != nil {
-				log.Warnf("GetDevice: Get volume %s device %s by Serial, but validate error %s", volumeID, device, err.Error())
-				return "", fmt.Errorf("PartitionError: Get volume %s device %s by Serial, but validate error %s ", volumeID, device, err.Error())
+			if devices, err = adaptDevicePartition(device); err != nil {
+				log.Log.Warnf("GetDevice: Get volume %s device %s by Serial, but validate error %s", volumeID, device, err.Error())
+				return []string{}, fmt.Errorf("PartitionError: Get volume %s device %s by Serial, but validate error %s ", volumeID, device, err.Error())
 			}
-			log.Infof("GetDevice: Use the serial to find device, got %s, volumeID: %s", device, volumeID)
-			return device, nil
+			log.Log.Infof("GetDevice: Use the serial to find device, got %s, volumeID: %s, devices: %v", device, volumeID, devices)
+			return devices, nil
 		}
 	}
 
 	// Get NVME device name
-	device, err = getNvmeDeviceByVolumeID(volumeID)
+	device, err := getNvmeDeviceByVolumeID(volumeID)
 	if err == nil && device != "" {
-		return device, nil
+		return []string{device}, nil
 	}
 
 	byIDPath := "/dev/disk/by-id/"
@@ -704,35 +662,35 @@ func GetDeviceByVolumeID(volumeID string) (device string, err error) {
 				}
 			}
 			if !isSearched {
-				log.Warnf("volumeID link path %q not found", volumeLinPath)
-				return "", fmt.Errorf("volumeID link path %q not found", volumeLinPath)
+				log.Log.Warnf("volumeID link path %q not found", volumeLinPath)
+				return []string{}, fmt.Errorf("volumeID link path %q not found", volumeLinPath)
 			}
 		} else {
-			return "", fmt.Errorf("error getting stat of %q: %v", volumeLinPath, err)
+			return []string{}, fmt.Errorf("error getting stat of %q: %v", volumeLinPath, err)
 		}
 	}
 
 	if stat.Mode()&os.ModeSymlink != os.ModeSymlink {
-		log.Warningf("volumeID link file %q found, but was not a symlink", volumeLinPath)
-		return "", fmt.Errorf("volumeID link file %q found, but was not a symlink", volumeLinPath)
+		log.Log.Warningf("volumeID link file %q found, but was not a symlink", volumeLinPath)
+		return []string{}, fmt.Errorf("volumeID link file %q found, but was not a symlink", volumeLinPath)
 	}
 	// Find the target, resolving to an absolute path
 	// For example, /dev/disk/by-id/virtio-wz9cu3ctp6aj1iagco4h -> ../../vdc
 	resolved, err := filepath.EvalSymlinks(volumeLinPath)
 	if err != nil {
-		return "", fmt.Errorf("error reading target of symlink %q: %v", volumeLinPath, err)
+		return []string{}, fmt.Errorf("error reading target of symlink %q: %v", volumeLinPath, err)
 	}
 	if !strings.HasPrefix(resolved, "/dev") {
-		return "", fmt.Errorf("resolved symlink for %q was unexpected: %q", volumeLinPath, resolved)
+		return []string{}, fmt.Errorf("resolved symlink for %q was unexpected: %q", volumeLinPath, resolved)
 	}
 
-	if resolved, err = adaptDevicePartition(resolved); err != nil {
-		log.Warnf("GetDevice: Get volume %s device %s by ID, but validate error %s", volumeID, resolved, err.Error())
-		return "", fmt.Errorf("PartitionError: Get volume %s device %s by Serial, but validate error %s ", volumeID, resolved, err.Error())
+	if devices, err = adaptDevicePartition(resolved); err != nil {
+		log.Log.Warnf("GetDevice: Get volume %s device %s by ID, but validate error %s", volumeID, resolved, err.Error())
+		return []string{}, fmt.Errorf("PartitionError: Get volume %s device %s by Serial, but validate error %s ", volumeID, resolved, err.Error())
 	}
 
-	log.Infof("GetDevice: Device Link Info: %s link to %s", volumeLinPath, resolved)
-	return resolved, nil
+	log.Log.Infof("GetDevice: Device Link Info: %s link to %s", volumeLinPath, devices)
+	return devices, nil
 }
 
 // GetVolumeIDByDevice get volumeID by specific deivce name according to by-id dictionary
@@ -760,7 +718,7 @@ func GetVolumeIDByDevice(device string) (volumeID string, err error) {
 		if stat.Mode()&os.ModeSymlink == os.ModeSymlink {
 			resolved, err := filepath.EvalSymlinks(filePath)
 			if err != nil {
-				log.Errorf("GetVolumeIDByDevice: error reading target of symlink %q: %v", filePath, err)
+				log.Log.Errorf("GetVolumeIDByDevice: error reading target of symlink %q: %v", filePath, err)
 				continue
 			}
 			if strings.HasSuffix(resolved, device) {
@@ -840,94 +798,23 @@ func IsDeviceUsedOthers(deviceName, volumeID string) (bool, error) {
 	return false, nil
 }
 
-// formatAndMount uses unix utils to format and mount the given disk
-func formatAndMount(diskMounter *k8smount.SafeFormatAndMount, source string, target string, fstype string, mkfsOptions []string, mountOptions []string) error {
-	readOnly := false
-	for _, option := range mountOptions {
-		if option == "ro" {
-			readOnly = true
-			break
+func getMultiZones(segments map[string]string) (string, bool) {
+	parseZone := func(key string) string {
+		return key[len(TopologyMultiZonePrefix):]
+	}
+
+	var zones []string
+	for k := range segments {
+		if strings.HasPrefix(k, TopologyMultiZonePrefix) {
+			zones = append(zones, parseZone(k))
 		}
 	}
 
-	// check device fs
-	mountOptions = append(mountOptions, "defaults")
-	if !readOnly {
-		// Run fsck on the disk to fix repairable issues, only do this for volumes requested as rw.
-		args := []string{"-a", source}
-
-		out, err := diskMounter.Exec.Command("fsck", args...).CombinedOutput()
-		if err != nil {
-			ee, isExitError := err.(utilexec.ExitError)
-			switch {
-			case err == utilexec.ErrExecutableNotFound:
-				log.Warningf("'fsck' not found on system; continuing mount without running 'fsck'.")
-			case isExitError && ee.ExitStatus() == fsckErrorsCorrected:
-				log.Infof("Device %s has errors which were corrected by fsck.", source)
-			case isExitError && ee.ExitStatus() == fsckErrorsUncorrected:
-				return fmt.Errorf("'fsck' found errors on device %s but could not correct them: %s", source, string(out))
-			case isExitError && ee.ExitStatus() > fsckErrorsUncorrected:
-			}
-		}
+	if len(zones) == 0 {
+		return "", false
 	}
 
-	// Try to mount the disk
-	mountErr := diskMounter.Interface.Mount(source, target, fstype, mountOptions)
-	if mountErr != nil {
-		// Mount failed. This indicates either that the disk is unformatted or
-		// it contains an unexpected filesystem.
-		existingFormat, err := diskMounter.GetDiskFormat(source)
-		if err != nil {
-			return err
-		}
-		if existingFormat == "" {
-			if readOnly {
-				// Don't attempt to format if mounting as readonly, return an error to reflect this.
-				return errors.New("failed to mount unformatted volume as read only")
-			}
-
-			// Disk is unformatted so format it.
-			args := []string{source}
-			// Use 'ext4' as the default
-			if len(fstype) == 0 {
-				fstype = "ext4"
-			}
-
-			if fstype == "ext4" || fstype == "ext3" {
-				args = []string{
-					"-F",  // Force flag
-					"-m0", // Zero blocks reserved for super-user
-					source,
-				}
-				// add mkfs options
-				if len(mkfsOptions) != 0 {
-					args = []string{}
-					for _, opts := range mkfsOptions {
-						args = append(args, opts)
-					}
-					args = append(args, source)
-				}
-			}
-			log.Infof("Disk %q appears to be unformatted, attempting to format as type: %q with options: %v", source, fstype, args)
-
-			_, err := diskMounter.Exec.Command("mkfs."+fstype, args...).CombinedOutput()
-			if err == nil {
-				// the disk has been formatted successfully try to mount it again.
-				return diskMounter.Interface.Mount(source, target, fstype, mountOptions)
-			}
-			log.Errorf("format of disk %q failed: type:(%q) target:(%q) options:(%q)error:(%v)", source, fstype, target, mkfsOptions, err)
-			return err
-		}
-		// Disk is already formatted and failed to mount
-		if len(fstype) == 0 || fstype == existingFormat {
-			// This is mount error
-			return mountErr
-		}
-		// Block device is formatted with unexpected filesystem, let the user know
-		return fmt.Errorf("failed to mount the volume as %q, it already contains %s. Mount error: %v", fstype, existingFormat, mountErr)
-	}
-
-	return mountErr
+	return strings.Join(zones, ","), true
 }
 
 // pickZone selects 1 zone given topology requirement.
@@ -937,12 +824,24 @@ func pickZone(requirement *csi.TopologyRequirement) string {
 		return ""
 	}
 	for _, topology := range requirement.GetPreferred() {
+		if GlobalConfigVar.NodeMultiZoneEnable {
+			zones, exists := getMultiZones(topology.GetSegments())
+			if exists {
+				return zones
+			}
+		}
 		zone, exists := topology.GetSegments()[TopologyZoneKey]
 		if exists {
 			return zone
 		}
 	}
 	for _, topology := range requirement.GetRequisite() {
+		if GlobalConfigVar.NodeMultiZoneEnable {
+			zones, exists := getMultiZones(topology.GetSegments())
+			if exists {
+				return zones
+			}
+		}
 		zone, exists := topology.GetSegments()[TopologyZoneKey]
 		if exists {
 			return zone
@@ -951,18 +850,27 @@ func pickZone(requirement *csi.TopologyRequirement) string {
 	return ""
 }
 
+func validateDiskVolumeCreateOptions(kv map[string]string) error {
+	valid, err := utils.ValidateRequest(kv)
+	if !valid {
+		return err
+	}
+	return nil
+}
+
 // getDiskVolumeOptions
 func getDiskVolumeOptions(req *csi.CreateVolumeRequest) (*diskVolumeArgs, error) {
 	var ok bool
 	diskVolArgs := &diskVolumeArgs{}
 	volOptions := req.GetParameters()
 
+	validateDiskVolumeCreateOptions(volOptions)
 	if diskVolArgs.ZoneID, ok = volOptions[ZoneID]; !ok {
 		if diskVolArgs.ZoneID, ok = volOptions[strings.ToLower(ZoneID)]; !ok {
 			// topology aware feature to get zoneid
 			diskVolArgs.ZoneID = pickZone(req.GetAccessibilityRequirements())
 			if diskVolArgs.ZoneID == "" {
-				log.Errorf("CreateVolume: Can't get topology info , please check your setup or set zone ID in storage class. Use zone from Meta service: %s", req.Name)
+				log.Log.Errorf("CreateVolume: Can't get topology info , please check your setup or set zone ID in storage class. Use zone from Meta service: %s", req.Name)
 				diskVolArgs.ZoneID = GetMetaData(ZoneIDTag)
 			}
 		}
@@ -984,22 +892,18 @@ func getDiskVolumeOptions(req *csi.CreateVolumeRequest) (*diskVolumeArgs, error)
 		diskVolArgs.RegionID = GlobalConfigVar.Region
 	}
 
-	diskVolArgs.PerformanceLevel, ok = volOptions["performanceLevel"]
-	if !ok {
-		diskVolArgs.PerformanceLevel = PERFORMANCELEVELPL1
-	}
 	diskVolArgs.NodeSelected, _ = volOptions[NodeSchedueTag]
 
 	// fstype
 	// https://github.com/kubernetes-csi/external-provisioner/releases/tag/v1.0.1
-	diskVolArgs.FsType, ok = volOptions["csi.storage.k8s.io/fstype"]
+	diskVolArgs.FsType, ok = volOptions[CSI_DEFAULT_FS_TYPE]
 	if !ok {
-		diskVolArgs.FsType, ok = volOptions["fsType"]
+		diskVolArgs.FsType, ok = volOptions[FS_TYPE]
 		if !ok {
-			diskVolArgs.FsType = "ext4"
+			diskVolArgs.FsType = EXT4_FSTYPE
 		}
 	}
-	if diskVolArgs.FsType != "ext4" && diskVolArgs.FsType != "ext3" && diskVolArgs.FsType != "xfs" {
+	if diskVolArgs.FsType != EXT4_FSTYPE && diskVolArgs.FsType != EXT3_FSTYPE && diskVolArgs.FsType != XFS_FSTYPE {
 		return nil, fmt.Errorf("illegal required parameter fsType, only support ext3, ext4 and xfs, the input is: %s", diskVolArgs.FsType)
 	}
 
@@ -1009,6 +913,11 @@ func getDiskVolumeOptions(req *csi.CreateVolumeRequest) (*diskVolumeArgs, error)
 		return nil, fmt.Errorf("Illegal required parameter type: " + diskVolArgs.Type)
 	}
 	diskVolArgs.Type = diskType
+	pls, err := validateDiskPerformaceLevel(volOptions)
+	if err != nil {
+		return nil, err
+	}
+	diskVolArgs.PerformanceLevel = pls
 
 	// readonly, default false
 	value, ok := volOptions["readOnly"]
@@ -1039,13 +948,19 @@ func getDiskVolumeOptions(req *csi.CreateVolumeRequest) (*diskVolumeArgs, error)
 	// MultiAttach
 	diskVolArgs.MultiAttach, ok = volOptions["multiAttach"]
 	if !ok {
-		diskVolArgs.DiskTags = "Disabled"
+		diskVolArgs.MultiAttach = "Disabled"
 	}
 
 	// DiskTags
-	diskVolArgs.DiskTags, ok = volOptions["diskTags"]
-	if !ok {
-		diskVolArgs.DiskTags = ""
+	diskTags, ok := volOptions["diskTags"]
+	if ok {
+		for _, tag := range strings.Split(diskTags, ",") {
+			tagParts := strings.Split(tag, ":")
+			if len(tagParts) != 2 {
+				return nil, status.Errorf(codes.Internal, "Invalid diskTags format name: %s tags: %s", req.GetName(), diskTags)
+			}
+			diskVolArgs.DiskTags = append(diskVolArgs.DiskTags, tag)
+		}
 	}
 
 	// kmsKeyId
@@ -1066,6 +981,16 @@ func getDiskVolumeOptions(req *csi.CreateVolumeRequest) (*diskVolumeArgs, error)
 		diskVolArgs.ResourceGroupID = ""
 	}
 
+	diskVolArgs.StorageClusterID, ok = volOptions["storageClusterId"]
+	if !ok {
+		diskVolArgs.StorageClusterID = ""
+	}
+
+	if diskVolArgs.StorageClusterID != "" {
+		if diskVolArgs.PerformanceLevel == "" {
+			return nil, fmt.Errorf("performaceLevel is necessary when storageClusterID: '%s' specified", diskVolArgs.StorageClusterID)
+		}
+	}
 	// volumeSizeAutoAvailable
 	value, ok = volOptions["volumeSizeAutoAvailable"]
 	if !ok {
@@ -1079,6 +1004,23 @@ func getDiskVolumeOptions(req *csi.CreateVolumeRequest) (*diskVolumeArgs, error)
 		}
 	}
 
+	// volumeExpandAutoSnapshot, default closed
+	if value, ok = volOptions[VOLUME_EXPAND_AUTO_SNAPSHOT_OP_KEY]; ok {
+		value = strings.ToLower(value)
+		if value != "forced" && value != "besteffort" && value != "closed" {
+			return nil, fmt.Errorf("illegal optional parameter volumeExpandAutoSnapshot, only support forced, besteffort and closed, the input is: %s", value)
+		}
+	}
+	if value, ok = volOptions[VOLUME_DELETE_AUTO_SNAPSHOT_OP_RETENT_DAYS_KEY]; ok {
+		iValue, err := strconv.Atoi(value)
+		if err != nil {
+			return nil, fmt.Errorf("getDiskVolumeOptions: parameters volumeDeleteSnapshotRetentionDays[%s] is illegal", value)
+		}
+		if iValue <= SNAPSHOT_MAX_RETENTION_DAYS && iValue >= SNAPSHOT_MIN_RETENTION_DAYS {
+			diskVolArgs.DelAutoSnap = value
+		}
+	}
+
 	return diskVolArgs, nil
 }
 
@@ -1088,10 +1030,10 @@ func validateDiskType(opts map[string]string) (diskType string, err error) {
 		return
 	}
 	if strings.Contains(opts["type"], ",") {
-		orderedList := make([]string, 3)
+		orderedList := []string{}
 		for _, cusType := range strings.Split(opts["type"], ",") {
-			if value, ok := CustomDiskTypes[cusType]; ok {
-				orderedList[value] = cusType
+			if _, ok := CustomDiskTypes[cusType]; ok {
+				orderedList = append(orderedList, cusType)
 			} else {
 				return diskType, fmt.Errorf("Illegal required parameter type: " + cusType)
 			}
@@ -1099,7 +1041,7 @@ func validateDiskType(opts map[string]string) (diskType string, err error) {
 		diskType = strings.Join(orderedList, ",")
 		return
 	}
-	for _, t := range AvaliableDiskTypes {
+	for _, t := range AvailableDiskTypes {
 		if opts["type"] == t {
 			diskType = t
 		}
@@ -1108,6 +1050,22 @@ func validateDiskType(opts map[string]string) (diskType string, err error) {
 		return diskType, fmt.Errorf("Illegal required parameter type: " + opts["type"])
 	}
 	return
+}
+
+func validateDiskPerformaceLevel(opts map[string]string) (performaceLevel string, err error) {
+	pl, ok := opts[ESSD_PERFORMANCE_LEVEL]
+	if !ok || pl == "" {
+		return "", nil
+	}
+	log.Log.Infof("validateDiskPerformaceLevel: pl: %v", pl)
+	if strings.Contains(pl, ",") {
+		for _, cusPer := range strings.Split(pl, ",") {
+			if _, ok := CustomDiskPerfermance[cusPer]; !ok {
+				return "", fmt.Errorf("Illegal performace level type: %s", cusPer)
+			}
+		}
+	}
+	return pl, nil
 }
 
 func checkDeviceAvailable(devicePath, volumeID, targetPath string) error {
@@ -1158,13 +1116,14 @@ func checkDeviceAvailable(devicePath, volumeID, targetPath string) error {
 }
 
 // GetVolumeDeviceName get device name
-func GetVolumeDeviceName(diskID string) string {
-	deviceName, err := GetDeviceByVolumeID(diskID)
+func GetVolumeDeviceName(diskID string) []string {
+	devices, err := GetDeviceByVolumeID(diskID)
 	if err != nil {
-		deviceName = getVolumeConfig(diskID)
-		log.Infof("GetVolumeDeviceName, Get Device Name by Config File %s, DeviceName: %s", diskID, deviceName)
+		deviceName := getVolumeConfig(diskID)
+		devices = []string{deviceName}
+		log.Log.Infof("GetVolumeDeviceName, Get Device Name by Config File %s, DeviceName: %s", diskID, deviceName)
 	}
-	return deviceName
+	return devices
 }
 
 // isPathAvailiable
@@ -1194,12 +1153,12 @@ func deleteEmpty(s []string) []string {
 func getDiskCapacity(devicePath string) (float64, error) {
 	_, capacity, _, _, _, _, err := fs.FsInfo(devicePath)
 	if err != nil {
-		log.Errorf("getDiskCapacity:: get device error: %+v", err)
+		log.Log.Errorf("getDiskCapacity:: get device error: %+v", err)
 		return 0, fmt.Errorf("getDiskCapacity:: get device error: %+v", err)
 	}
 	capacity, ok := (*(resource.NewQuantity(capacity, resource.BinarySI))).AsInt64()
 	if !ok {
-		log.Errorf("getDiskCapacity:: failed to fetch capacity bytes for target: %s", devicePath)
+		log.Log.Errorf("getDiskCapacity:: failed to fetch capacity bytes for target: %s", devicePath)
 		return 0, status.Error(codes.Unknown, "failed to fetch capacity bytes")
 	}
 	return float64(capacity) / GBSIZE, nil
@@ -1209,42 +1168,47 @@ func getBlockDeviceCapacity(devicePath string) float64 {
 
 	file, err := os.Open(devicePath)
 	if err != nil {
-		log.Errorf("getBlockDeviceCapacity:: failed to open devicePath: %v", devicePath)
+		log.Log.Errorf("getBlockDeviceCapacity:: failed to open devicePath: %v", devicePath)
 		return 0
 	}
 	pos, err := file.Seek(0, io.SeekEnd)
 	if err != nil {
-		log.Errorf("getBlockDeviceCapacity:: failed to read devicePath: %v", devicePath)
+		log.Log.Errorf("getBlockDeviceCapacity:: failed to read devicePath: %v", devicePath)
 		return 0
 	}
 	return float64(pos) / GBSIZE
 }
 
 // UpdateNode ...
-func UpdateNode(nodeID string, client *kubernetes.Clientset, c *ecs.Client) {
+func UpdateNode(nodeID string, c *ecs.Client) {
 	instanceStorageLabels := []string{}
 	ctx := context.Background()
 	nodeName := os.Getenv(kubeNodeName)
-	nodeInfo, err := client.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
+	nodeInfo, err := GlobalConfigVar.ClientSet.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
 	if err != nil {
-		log.Errorf("UpdateNode:: get node info error : %s", err.Error())
+		log.Log.Errorf("UpdateNode:: get node info error : %s", err.Error())
 		return
 	}
 	instanceType := nodeInfo.Labels[instanceTypeLabel]
 	zoneID := nodeInfo.Labels[zoneIDLabel]
+	if instanceType == "" && zoneID == "" {
+		instanceType = nodeInfo.Labels[sigmaInstanceTypeLabel]
+		zoneID = nodeInfo.Labels[sigmaLabelZoneId]
+	}
 	request := ecs.CreateDescribeAvailableResourceRequest()
 	request.InstanceType = instanceType
 	request.DestinationResource = describeResourceType
 	request.ZoneId = zoneID
 	var response *ecs.DescribeAvailableResourceResponse
-	for n := 1; n < RetryMaxTimes; n++ {
+	waitErr := wait.PollImmediate(updatePollInterval, 30*time.Second, func() (bool, error) {
 		response, err = c.DescribeAvailableResource(request)
 		if err != nil {
-			log.Errorf("UpdateNode:: describe available resource with nodeID: %s", instanceType)
-			continue
+			log.Log.Errorf("UpdateNode:: describe available resource with nodeID: %s", instanceType)
+			return false, err
 		}
-		break
-	}
+		return true, nil
+	})
+	log.Log.Infof("UpdateNode: record ecs openapi req: %+v, resp: %+v", request, response)
 	availableZones := response.AvailableZones.AvailableZone
 	if len(availableZones) == 1 {
 		availableZone := availableZones[0]
@@ -1257,15 +1221,15 @@ func UpdateNode(nodeID string, client *kubernetes.Clientset, c *ecs.Client) {
 					instanceStorageLabels = append(instanceStorageLabels, labelKey)
 				}
 			} else {
-				log.Errorf("UpdateNode:: multi available datadisk error: %v", availableResources)
+				log.Log.Errorf("UpdateNode:: multi available datadisk error: %v", availableResources)
 				return
 			}
 		} else {
-			log.Errorf("UpdateNode:: multi available resource error: %v", availableResources)
+			log.Log.Errorf("UpdateNode:: multi available resource error: %v", availableResources)
 			return
 		}
 	} else {
-		log.Errorf("UpdateNode:: multi available zones error: %v", availableZones)
+		log.Log.Errorf("UpdateNode:: multi available zones error: %v", availableZones)
 		return
 	}
 	needUpdate := false
@@ -1278,25 +1242,46 @@ func UpdateNode(nodeID string, client *kubernetes.Clientset, c *ecs.Client) {
 			needUpdateLabels = append(needUpdateLabels, storageLabel)
 		}
 	}
-	for n := 1; n < RetryMaxTimes; n++ {
+
+	// Retry the update on error, until we hit a timeout.
+	// TODO: Determine whether "retry with timeout" is appropriate here. Maybe we should only retry on version conflict.
+	var lastUpdateError error
+	waitErr = wait.PollImmediate(updatePollInterval, 30*time.Second, func() (bool, error) {
 		if needUpdate {
-			newNode, err := client.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
+			newNode, err := GlobalConfigVar.ClientSet.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
 			if err != nil {
-				continue
+				lastUpdateError = err
+				return false, err
 			}
 			for _, updatedLabel := range needUpdateLabels {
 				newNode.Labels[updatedLabel] = "available"
 			}
-			_, err = client.CoreV1().Nodes().Update(ctx, newNode, metav1.UpdateOptions{})
+			_, err = GlobalConfigVar.ClientSet.CoreV1().Nodes().Update(ctx, newNode, metav1.UpdateOptions{})
 			if err != nil {
-				log.Errorf("UpdateNode:: update node error: %s", err.Error())
-				continue
+				lastUpdateError = err
+				return false, err
 			}
 		} else {
-			log.Info("UpdateNode:: need not to update node label")
+			log.Log.Info("UpdateNode:: need not to update node label")
 		}
-		return
+		return true, nil
+	})
+	if waitErr != nil {
+		log.Log.Errorf("UpdateNode:: failed to update node status: err: %v", lastUpdateError)
 	}
+}
+
+func getMeta(node *v1.Node) (string, string, string) {
+	zoneID := ""
+	regionID := ""
+	if value := node.Labels[zoneIDLabelNew]; value != "" {
+		zoneID = value
+	}
+	if value := node.Labels[regionIDLabelNew]; value != "" {
+		log.Log.Infof("getZoneID:: fix regionid value by: %s", value)
+		regionID = value
+	}
+	return regionID, zoneID, ""
 }
 
 // getZoneID ...
@@ -1304,7 +1289,7 @@ func getZoneID(c *ecs.Client, instanceID string) (string, string) {
 
 	node, err := GlobalConfigVar.ClientSet.CoreV1().Nodes().Get(context.Background(), instanceID, metav1.GetOptions{})
 	if err != nil {
-		log.Fatalf("getZoneID:: get node error: %v", err)
+		log.Log.Fatalf("getZoneID:: get node error: %v", err)
 	}
 	ecsKey := os.Getenv("NODE_LABEL_ECS_ID_KEY")
 	ecsID := ""
@@ -1312,6 +1297,9 @@ func getZoneID(c *ecs.Client, instanceID string) (string, string) {
 		ecsID = instanceID
 	} else {
 		ecsID = node.Labels[ecsKey]
+	}
+	if value := node.Labels[zoneIDLabelNew]; value != "" {
+		return value, ecsID
 	}
 	request := ecs.CreateDescribeInstancesRequest()
 
@@ -1325,10 +1313,10 @@ func getZoneID(c *ecs.Client, instanceID string) (string, string) {
 	}
 	instanceResponse, err := c.DescribeInstances(request)
 	if err != nil {
-		log.Fatalf("getZoneID:: describe instance id error: %s ecsID: %s", err.Error(), ecsID)
+		log.Log.Fatalf("getZoneID:: describe instance id error: %s ecsID: %s", err.Error(), ecsID)
 	}
 	if len(instanceResponse.Instances.Instance) != 1 {
-		log.Fatalf("getZoneID:: describe instance returns error instance count: %v, ecsID: %v", len(instanceResponse.Instances.Instance), ecsID)
+		log.Log.Fatalf("getZoneID:: describe instance returns error instance count: %v, ecsID: %v", len(instanceResponse.Instances.Instance), ecsID)
 	}
 	return instanceResponse.Instances.Instance[0].ZoneId, ecsID
 }
@@ -1424,9 +1412,69 @@ func createRoleClient(uid string) (cli *ecs.Client, err error) {
 	return cli, nil
 }
 
+func volumeCreate(diskType, diskID string, volSizeBytes int64, volumeContext map[string]string, zoneID string, contextSource *csi.VolumeContentSource) *csi.Volume {
+	accessibleTopology := []*csi.Topology{
+		{
+			Segments: map[string]string{
+				TopologyZoneKey: zoneID,
+			},
+		},
+	}
+	if GlobalConfigVar.NodeMultiZoneEnable {
+		accessibleTopology = append(accessibleTopology, &csi.Topology{
+			Segments: map[string]string{
+				TopologyMultiZonePrefix + zoneID: "true",
+			},
+		})
+	}
+	if diskType != "" {
+		// Add PV Label
+		diskTypePL := diskType
+		if diskType == DiskESSD {
+			if pl, ok := volumeContext[ESSD_PERFORMANCE_LEVEL]; ok && pl != "" {
+				diskTypePL = fmt.Sprintf("%s.%s", DiskESSD, pl)
+				// TODO delete performanceLevel key
+				// delete(volumeContext, "performanceLevel")
+			} else {
+				diskTypePL = fmt.Sprintf("%s.%s", DiskESSD, "PL1")
+			}
+		}
+		volumeContext[labelAppendPrefix+labelVolumeType] = diskTypePL
+		// TODO delete type key
+		// delete(volumeContext, "type")
+
+		// Add PV NodeAffinity
+		labelKey := fmt.Sprintf(nodeStorageLabel, diskType)
+		expressions := []v1.NodeSelectorRequirement{{
+			Key:      labelKey,
+			Operator: v1.NodeSelectorOpIn,
+			Values:   []string{"available"},
+		}}
+		terms := []v1.NodeSelectorTerm{{
+			MatchExpressions: expressions,
+		}}
+		diskTypeTopo := &v1.NodeSelector{
+			NodeSelectorTerms: terms,
+		}
+		diskTypeTopoBytes, _ := json.Marshal(diskTypeTopo)
+		volumeContext[annAppendPrefix+annVolumeTopoKey] = string(diskTypeTopoBytes)
+	}
+
+	log.Log.Infof("volumeCreate: volumeContext: %+v", volumeContext)
+	tmpVol := &csi.Volume{
+		CapacityBytes:      volSizeBytes,
+		VolumeId:           diskID,
+		VolumeContext:      volumeContext,
+		AccessibleTopology: accessibleTopology,
+		ContentSource:      contextSource,
+	}
+
+	return tmpVol
+}
+
 // staticVolumeCreate 检查输入参数，如果包含了云盘ID，则直接使用云盘进行返回；
 // 根据云盘ID请求云盘的具体属性，并作为pv参数返回；
-func staticVolumeCreate(req *csi.CreateVolumeRequest) (*csi.Volume, error) {
+func staticVolumeCreate(req *csi.CreateVolumeRequest, snapshotID string) (*csi.Volume, error) {
 	paras := req.GetParameters()
 	diskID := paras[annDiskID]
 	if diskID == "" {
@@ -1449,29 +1497,33 @@ func staticVolumeCreate(req *csi.CreateVolumeRequest) (*csi.Volume, error) {
 	volumeContext = updateVolumeContext(volumeContext)
 	volumeContext["type"] = disk.Category
 	volSizeBytes := int64(req.GetCapacityRange().GetRequiredBytes())
-	diskSizeBytes := int64(disk.Size) * 1024 * 1024 * 1024
+	diskSizeBytes := utils.Gi2Bytes(int64(disk.Size))
 	if volSizeBytes != diskSizeBytes {
 		return nil, perrors.Errorf("Disk %s is not expected capacity: expected(%d), disk(%d)", diskID, volSizeBytes, diskSizeBytes)
 	}
 
-	tmpVol := &csi.Volume{
-		VolumeId:      diskID,
-		CapacityBytes: volSizeBytes,
-		VolumeContext: volumeContext,
-		AccessibleTopology: []*csi.Topology{
-			{
-				Segments: map[string]string{
-					TopologyZoneKey: disk.ZoneId,
+	// Set VolumeContentSource
+	var src *csi.VolumeContentSource
+	if snapshotID != "" {
+		src = &csi.VolumeContentSource{
+			Type: &csi.VolumeContentSource_Snapshot{
+				Snapshot: &csi.VolumeContentSource_SnapshotSource{
+					SnapshotId: snapshotID,
 				},
 			},
-		},
+		}
 	}
-	return tmpVol, nil
+
+	return volumeCreate(disk.Category, diskID, volSizeBytes, volumeContext, disk.ZoneId, src), nil
 }
 
-// updateVolumeContext remove unneccessary volume context
+// updateVolumeContext remove unnecessary volume context
 func updateVolumeContext(volumeContext map[string]string) map[string]string {
-	for _, key := range []string{LastApplyKey, PvNameKey, PvcNameKey, PvcNamespaceKey, StorageProvisionerKey, "csi.alibabacloud.com/reclaimPolicy", "csi.alibabacloud.com/storageclassName", "allowVolumeExpansion", "volume.kubernetes.io/selected-node"} {
+	for _, key := range []string{
+		LastApplyKey, PvNameKey, PvcNameKey, PvcNamespaceKey,
+		StorageProvisionerKey, "csi.alibabacloud.com/reclaimPolicy",
+		"csi.alibabacloud.com/storageclassName",
+		"allowVolumeExpansion", "volume.kubernetes.io/selected-node"} {
 		if _, ok := volumeContext[key]; ok {
 			delete(volumeContext, key)
 		}
@@ -1483,7 +1535,7 @@ func updateVolumeContext(volumeContext map[string]string) map[string]string {
 func getSnapshotInfoByID(snapshotID string) (string, string, *timestamp.Timestamp) {
 	content, err := GlobalConfigVar.SnapClient.SnapshotV1().VolumeSnapshotContents().Get(context.TODO(), snapshotID, metav1.GetOptions{})
 	if err != nil {
-		log.Errorf("getSnapshotContentByID:: get snapshot content in cluster err: %v", content)
+		log.Log.Errorf("getSnapshotContentByID:: get snapshot content in cluster err: %v", err)
 		return "", "", nil
 	}
 	if targetRegion, ok := content.Labels[RemoteSnapshotLabelKey]; ok {
@@ -1507,7 +1559,7 @@ func getVolumeCount() int64 {
 		if instanceType == "" {
 			instanceType, err = utils.GetMetaData("instance/instance-type")
 			if err != nil {
-				log.Warnf("getVolumeCount: get instance type with error: %s", err.Error())
+				log.Log.Warnf("getVolumeCount: get instance type with error: %s", err.Error())
 				time.Sleep(time.Duration(1) * time.Second)
 				continue
 			}
@@ -1520,7 +1572,7 @@ func getVolumeCount() int64 {
 		response, err := ecsClient.DescribeInstanceTypes(req)
 		// if auth failed, return with default
 		if err != nil && strings.Contains(err.Error(), "Forbidden") {
-			log.Errorf("getVolumeCount: describe instance type with error: %s", err.Error())
+			log.Log.Errorf("getVolumeCount: describe instance type with error: %s", err.Error())
 			return MaxVolumesPerNode
 			// not forbidden error, retry
 		} else if err != nil && !strings.Contains(err.Error(), "Forbidden") {
@@ -1528,11 +1580,11 @@ func getVolumeCount() int64 {
 			continue
 		}
 		if len(response.InstanceTypes.InstanceType) != 1 {
-			log.Warnf("getVolumeCount: get instance max volume failed type with %v", response)
+			log.Log.Warnf("getVolumeCount: get instance max volume failed type with %v", response)
 			return MaxVolumesPerNode
 		}
 		volumeCount = int64(response.InstanceTypes.InstanceType[0].DiskQuantity) - 2
-		log.Infof("getVolumeCount: get instance max volume %d type with response %v", volumeCount, response)
+		log.Log.Infof("getVolumeCount: get instance max volume %d type with response %v", volumeCount, response)
 		break
 	}
 	return volumeCount
@@ -1562,7 +1614,7 @@ func checkRundVolumeExpand(req *csi.NodeExpandVolumeRequest) (bool, error) {
 	// connect to rund server with timeout
 	clientConn, err := net.DialTimeout("unix", socketFile, 1*time.Second)
 	if err != nil {
-		log.Errorf("checkRundExpand: volume %s, volumepath %s, connect to rund server with error: %s", req.VolumeId, req.VolumePath, err.Error())
+		log.Log.Errorf("checkRundExpand: volume %s, volumepath %s, connect to rund server with error: %s", req.VolumeId, req.VolumePath, err.Error())
 		return true, perrors.Errorf("checkRundExpand: volume %s, volumepath %s, connect to rund server with error: %s", req.VolumeId, req.VolumePath, err.Error())
 	}
 	defer clientConn.Close()
@@ -1574,11 +1626,11 @@ func checkRundVolumeExpand(req *csi.NodeExpandVolumeRequest) (bool, error) {
 		Volume: pvName,
 	})
 	if err != nil {
-		log.Errorf("checkRundExpand: volume %s, volumepath %s, connect to rund server with error response: %s", req.VolumeId, req.VolumePath, err.Error())
+		log.Log.Errorf("checkRundExpand: volume %s, volumepath %s, connect to rund server with error response: %s", req.VolumeId, req.VolumePath, err.Error())
 		return true, perrors.Errorf("checkRundExpand: volume %s, volumepath %s, connect to rund server with error response: %s", req.VolumeId, req.VolumePath, err.Error())
 	}
 
-	log.Infof("RundVolumeExpand: Expand VolumeFS(%s) to(%s) successful with response: %s", pvName, volumeSize, resp)
+	log.Log.Infof("RundVolumeExpand: Expand VolumeFS(%s) to(%s) successful with response: %s", pvName, volumeSize, resp)
 	return true, nil
 }
 
@@ -1598,4 +1650,108 @@ func checkOptionFalse(opt string) bool {
 	default:
 		return false
 	}
+}
+
+// IsDeviceNvme check device is nvme type or not;
+func IsDeviceNvme(deviceName string) bool {
+	fileName := filepath.Base(deviceName)
+	if strings.HasPrefix(fileName, "nvme") {
+		return true
+	}
+	return false
+}
+
+// getPvPvcFromDiskId returns a pv instance with specified disk ID
+func getPvPvcFromDiskId(diskId string) (*v1.PersistentVolume, *v1.PersistentVolumeClaim, error) {
+	ctx := context.Background()
+	pv, err := GlobalConfigVar.ClientSet.CoreV1().PersistentVolumes().Get(ctx, diskId, metav1.GetOptions{})
+	if err != nil {
+		log.Log.Errorf("getPvcFromDiskId: failed to get pv from apiserver: %v", err)
+		return nil, nil, err
+	}
+	pvcName, pvcNamespace := pv.Spec.ClaimRef.Name, pv.Spec.ClaimRef.Namespace
+	pvc, err := GlobalConfigVar.ClientSet.CoreV1().PersistentVolumeClaims(pvcNamespace).Get(ctx, pvcName, metav1.GetOptions{})
+	if err != nil {
+		log.Log.Errorf("getPvcFromDiskId: failed to get pvc from apiserver: %v", err)
+		return nil, nil, err
+	}
+	return pv, pvc, nil
+}
+
+// UpdatePvcWithAnnotations update pvc
+func updatePvcWithAnnotations(ctx context.Context, pvc *v1.PersistentVolumeClaim, annotations map[string]string, option string) (*v1.PersistentVolumeClaim, error) {
+	switch option {
+	case "add":
+		for key, value := range annotations {
+			if pvc.Annotations == nil {
+				pvc.Annotations = map[string]string{key: value}
+			} else {
+				pvc.Annotations[key] = value
+			}
+		}
+	case "delete":
+		if pvc.Annotations != nil {
+			for key := range annotations {
+				if _, ok := pvc.Annotations[key]; ok {
+					delete(pvc.Annotations, key)
+				}
+			}
+		}
+	}
+	return GlobalConfigVar.ClientSet.CoreV1().PersistentVolumeClaims(pvc.Namespace).Update(ctx, pvc, metav1.UpdateOptions{})
+}
+
+func makeVolumeSnapshot(snapName string, snapContentName string) *volumeSnapshotV1.VolumeSnapshot {
+	vs := &volumeSnapshotV1.VolumeSnapshot{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: snapName,
+		},
+		Spec: volumeSnapshotV1.VolumeSnapshotSpec{
+			Source: volumeSnapshotV1.VolumeSnapshotSource{
+				VolumeSnapshotContentName: &snapContentName,
+			},
+		},
+	}
+	return vs
+}
+
+func makeVolumeSnapshotContent(snapName, snapContentName, snapshotID string) *volumeSnapshotV1.VolumeSnapshotContent {
+	vs := &volumeSnapshotV1.VolumeSnapshotContent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: snapContentName,
+		},
+		Spec: volumeSnapshotV1.VolumeSnapshotContentSpec{
+			VolumeSnapshotRef: v1.ObjectReference{
+				APIVersion: "snapshot.storage.k8s.io/v1",
+				Kind:       "VolumeSnapshot",
+				Name:       snapName,
+				Namespace:  "default",
+			},
+			DeletionPolicy: volumeSnapshotV1.VolumeSnapshotContentDelete,
+			Source: volumeSnapshotV1.VolumeSnapshotContentSource{
+				SnapshotHandle: &snapshotID,
+			},
+			Driver: "diskplugin.csi.alibabacloud.com",
+		},
+	}
+	return vs
+}
+
+func createStaticSnap(volumeID, snapshotID string, snapClient snapClientset.Interface) error {
+
+	volumeSnapshotName := fmt.Sprintf("%s-delprotect", volumeID)
+	volumeSnapshotContentName := fmt.Sprintf("%s-delprotect-content", volumeID)
+
+	volumeSnapshot := makeVolumeSnapshot(volumeSnapshotName, volumeSnapshotContentName)
+	volumeSnapshotContent := makeVolumeSnapshotContent(volumeSnapshotName, volumeSnapshotContentName, snapshotID)
+
+	_, err := snapClient.SnapshotV1().VolumeSnapshots("default").Create(context.Background(), volumeSnapshot, metav1.CreateOptions{})
+	if err != nil {
+		return err
+	}
+	_, err = snapClient.SnapshotV1().VolumeSnapshotContents().Create(context.Background(), volumeSnapshotContent, metav1.CreateOptions{})
+	if err != nil {
+		return err
+	}
+	return nil
 }

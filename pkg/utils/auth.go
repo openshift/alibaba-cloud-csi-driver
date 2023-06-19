@@ -33,12 +33,15 @@ import (
 	"github.com/aliyun/alibaba-cloud-sdk-go/sdk"
 	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/auth"
 	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/auth/credentials/provider"
+	"github.com/emirpasic/gods/sets/hashset"
+	oidc "github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/auth"
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc/credentials"
 	"io/ioutil"
 	"math/big"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -111,6 +114,7 @@ const (
 	EcsRAMRole
 	Credential
 	RoleArnToken
+	OIDCToken
 )
 
 // AccessControl is access control option
@@ -124,17 +128,111 @@ type AccessControl struct {
 	UseMode         AccessControlMode
 }
 
-func getAddonToken() AccessControl {
+var (
+	// cmdSet is support cmd set
+	cmdSet = hashset.New("mount", "lctl", "umount", "nsenter", "findmnt", "chmod", "dd", "mkfs.ext4", "cat", "ps", "hostname", "sysctl")
+	// cmdRegexp is not support cmd args
+	cmdRegexp = "[|$&;`'<>()%+\\\\]"
+)
+
+func CheckCmdArgs(cmd string, args ...string) error {
+	for _, element := range args {
+		match, err := regexp.MatchString(cmdRegexp, element)
+		if err != nil {
+			return fmt.Errorf("Command %s is regexp is failed, args:%s, err:%s.", cmd, element, err)
+		}
+		if match {
+			return fmt.Errorf("Command %s has illegal access, args:%s.", cmd, element)
+		}
+	}
+	return nil
+}
+
+func CheckCmd(cmd string, name string) error {
+	if !cmdSet.Contains(name) {
+		return fmt.Errorf("Command %s has illegal access, base command:%s.", cmd, name)
+	}
+	return nil
+}
+
+// CheckRequestArgs is check string is valid in args map
+func CheckRequestArgs(m map[string]string) (bool, error) {
+	valid := true
+	var msg string
+	for _, value := range m {
+		if strings.Contains(value, "&") || strings.Contains(value, "|") || strings.Contains(value, ";") ||
+			strings.Contains(value, "$") || strings.Contains(value, "'") || strings.Contains(value, "`") ||
+			strings.Contains(value, "(") || strings.Contains(value, ")") {
+			valid = false
+			msg = msg + fmt.Sprintf("Args %s has illegal access.", value)
+		}
+	}
+	return valid, errors.New(msg)
+}
+
+func ValidateRequest(m map[string]string) (bool, error) {
+	valid := true
+	var msg string
+	for _, value := range m {
+		if strings.Contains(value, "&") || strings.Contains(value, "|") || strings.Contains(value, ";") ||
+			strings.Contains(value, "$") || strings.Contains(value, "'") || strings.Contains(value, "`") ||
+			strings.Contains(value, "(") || strings.Contains(value, ")") {
+			valid = false
+			msg = msg + fmt.Sprintf("ValidateRequest: Args %s has illegal access.", value)
+		}
+		if valid, _ = ValidatePath(value); !valid {
+			msg = msg + fmt.Sprintf("ValidateRequest: Args %s has illegal path", value)
+			valid = false
+		}
+	}
+	return valid, errors.New(msg)
+}
+
+// ValidatePath is check path string is valid
+func ValidatePath(path string) (bool, error) {
+	var msg string
+	if strings.Contains(path, "../") || strings.Contains(path, "/..") || strings.Contains(path, "..") {
+		msg = msg + fmt.Sprintf("Path %s has illegal access.", path)
+		return false, errors.New(msg)
+	}
+	if strings.Contains(path, "./") || strings.Contains(path, "/.") {
+		msg = msg + fmt.Sprintf("Path %s has illegal access.", path)
+		return false, errors.New(msg)
+	}
+
+	return true, nil
+}
+
+func CheckRequest(m map[string]string, path string) (bool, error) {
+	valid, err := CheckRequestArgs(m)
+	if !valid {
+		return valid, err
+	}
+	valid, err = ValidatePath(path)
+	if !valid {
+		return valid, err
+	}
+	return valid, nil
+}
+
+func getManagedAddonToken() AccessControl {
 	tokens := getManagedToken()
 	return AccessControl{AccessKeyID: tokens.AccessKeyID, AccessKeySecret: tokens.AccessKeySecret, StsToken: tokens.SecurityToken, UseMode: ManagedToken}
 }
 
 // GetAccessControl  1、Read default ak from local file. 2、If local default ak is not exist, then read from STS.
 func GetAccessControl() AccessControl {
+
+	oidcToken := getOIDCToken()
+	if oidcToken.AccessKeyID != "" {
+		log.Info("Get AK: USE OIDC token")
+		return oidcToken
+	}
+
 	//1、Get AK from Env
-	acLocalAK := GetLocalAK()
+	acLocalAK := GetEnvAK()
 	if len(acLocalAK.AccessKeyID) != 0 && len(acLocalAK.AccessKeySecret) != 0 {
-		log.Info("Get AK: use Local AK")
+		log.Info("Get AK: use ENV AK")
 		return acLocalAK
 	}
 
@@ -146,20 +244,76 @@ func GetAccessControl() AccessControl {
 	}
 
 	//3、Get AK from ManagedToken
-	acAddonToken := getAddonToken()
+	acAddonToken := getManagedAddonToken()
 	if len(acAddonToken.AccessKeyID) != 0 {
-		log.Info("Get AK: use Addon Token")
+		log.Info("Get AK: use Managed Addon Token")
 		return acAddonToken
 	}
 
-	//4、Get AK from StsToken
+	//4、Get AK from ECS StsToken
 	acStsToken := getStsToken()
-	log.Info("Get AK: use Sts Token")
+	log.Info("Get AK: use ECS RamRole Token")
 	return acStsToken
+
 }
 
-// GetLocalAK read ossfs ak from local or from secret file
-func GetLocalAK() AccessControl {
+var oidcProvider oidc.Provider
+
+func getOIDCToken() AccessControl {
+
+	if os.Getenv("USE_OIDC_AUTH_INNER") != "true" {
+		return AccessControl{}
+	}
+	if oidcProvider != nil {
+		log.Infof("getOIDCToken: use exists provider")
+		resp, err := oidcProvider.GetStsTokenWithCache()
+		if err != nil || resp == nil {
+			log.Errorf("getOIDCtoken: failed to assume role with oidc : %++v", err)
+			return AccessControl{}
+		}
+		return AccessControl{AccessKeyID: strings.TrimSpace(resp.Credentials.AccessKeyId), AccessKeySecret: strings.TrimSpace(resp.Credentials.AccessKeySecret), StsToken: strings.TrimSpace(resp.Credentials.SecurityToken), UseMode: OIDCToken}
+	}
+
+	regionID := os.Getenv("REGION_ID")
+	if regionID == "" {
+		regionID = RetryGetMetaData("region-id")
+	}
+	if regionID == "" {
+		log.Error("getOIDCToken: failed to get regionid from metadata server")
+		return AccessControl{}
+	}
+	ownerId := os.Getenv("ACCOUNT_ID")
+	if ownerId == "" {
+		ownerId = RetryGetMetaData("owner-account-id")
+	}
+	log.Infof("getOIDCToken: cluster owner id: %v", ownerId)
+	if ownerId == "" {
+		log.Error("getOIDCToken: failed to get cluster owner id from metadata server")
+		return AccessControl{}
+	}
+
+	oidcProvider = oidc.NewOIDCProviderVPC(
+		regionID,
+		"alibaba-cloud-csi-controller",
+		"alibaba-cloud-csi-controller-oidc-provider",
+		"alibaba-cloud-csi-controller-oidc-role",
+		ownerId,
+		time.Duration(1000)*time.Second)
+	if oidcProvider == nil {
+		log.Errorf("getOIDCtoken: get empty provider")
+		return AccessControl{}
+	}
+	resp, err := oidcProvider.GetStsTokenWithCache()
+	if err != nil || resp == nil {
+		log.Errorf("getOIDCtoken: failed to assume role with oidc : %++v", err)
+		return AccessControl{}
+	}
+	return AccessControl{AccessKeyID: strings.TrimSpace(resp.Credentials.AccessKeyId), AccessKeySecret: strings.TrimSpace(resp.Credentials.AccessKeySecret), StsToken: strings.TrimSpace(resp.Credentials.SecurityToken), UseMode: OIDCToken}
+
+}
+
+// GetEnvAK read ak from local ENV
+func GetEnvAK() AccessControl {
 	accessKeyID, accessSecret := "", ""
 	accessKeyID = os.Getenv("ACCESS_KEY_ID")
 	accessSecret = os.Getenv("ACCESS_KEY_SECRET")
@@ -456,8 +610,14 @@ func getCredentialAK() AccessControl {
 	pc := provider.NewProviderChain([]provider.Provider{envProvider, profileProvider})
 	credential, err := pc.Resolve()
 	if err != nil {
-		log.Errorf("Failed to resolve an authentication provider: %v", err)
+		if !strings.Contains(err.Error(), "No credential found") {
+			log.Errorf("Failed to resolve an authentication provider: %v", err)
+		}
 	}
-	config := sdk.NewConfig().WithScheme("https")
+	scheme := "https"
+	if os.Getenv("ALICLOUD_CLIENT_SCHEME") == "HTTP" {
+		scheme = "http"
+	}
+	config := sdk.NewConfig().WithScheme(scheme)
 	return AccessControl{Config: config, Credential: credential, UseMode: Credential}
 }

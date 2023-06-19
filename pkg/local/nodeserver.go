@@ -36,10 +36,8 @@ import (
 	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/kubernetes/pkg/util/resizefs"
+	k8smount "k8s.io/mount-utils"
 	utilexec "k8s.io/utils/exec"
-	k8smount "k8s.io/utils/mount"
 )
 
 const (
@@ -63,6 +61,8 @@ const (
 	NodeAffinity = "nodeAffinity"
 	// ProjQuotaFullPath is the path of project quota
 	ProjQuotaFullPath = "projQuotaFullPath"
+	// ProjQuotaFullPath is the path of project quota
+	LoopDeviceFullPath = "loopDeviceFullPath"
 	// ProjQuotaProjectID is the project id of project quota
 	ProjQuotaProjectID = "projectID"
 	// LocalDisk local disk
@@ -83,63 +83,63 @@ const (
 
 type nodeServer struct {
 	*csicommon.DefaultNodeServer
-	nodeID     string
-	driverName string
-	mounter    utils.Mounter
-	client     kubernetes.Interface
-	k8smounter k8smount.Interface
+	nodeID        string
+	driverName    string
+	mounter       utils.Mounter
+	client        kubernetes.Interface
+	k8smounter    k8smount.Interface
+	SparseFileDir string
 }
 
 var (
-	masterURL  string
-	kubeconfig string
 	// DeviceChars is chars of a device
 	DeviceChars = []string{"b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z"}
 )
 
-func newKubeClient() *kubernetes.Clientset {
-	cfg, err := clientcmd.BuildConfigFromFlags(masterURL, kubeconfig)
-	if err != nil {
-		log.Fatalf("Error building kubeconfig: %s", err.Error())
-	}
-	kubeClient, err := kubernetes.NewForConfig(cfg)
-	if err != nil {
-		log.Fatalf("Error building kubernetes clientset: %s", err.Error())
-	}
-	return kubeClient
-}
-
 // NewNodeServer create a NodeServer object
 func NewNodeServer(d *csicommon.CSIDriver, dName, nodeID string) csi.NodeServer {
-	kubeClient := newKubeClient()
 	mounter := k8smount.New("")
 	serviceType := os.Getenv(utils.ServiceType)
 	if len(serviceType) == 0 || serviceType == "" {
 		serviceType = utils.PluginService
 	}
 
-	if serviceType == utils.PluginService {
-		// local volume daemon
-		// GRPC server to provide volume manage
-		ch := make(chan bool)
-		go server.Start(kubeClient, ch)
-		<-ch
-		// pv handler
-		// watch pv/pvc annotations and provide volume manage
-		go generator.VolumeHandler()
-
-		// maintain pmem node
-		if types.GlobalConfigVar.PmemEnable {
-			manager.MaintainPMEM(types.GlobalConfigVar.PmemType, mounter)
+	lpTemplateFile := ""
+	if types.GlobalConfigVar.LocalSparseFileDir != "" {
+		log.Infof("NewNodeServer: start to create templatefile with dir: %s, size: %s", types.GlobalConfigVar.LocalSparseFileDir, types.GlobalConfigVar.LocalSparseFileTempSize)
+		err := manager.MaintainSparseTemplateFile(types.GlobalConfigVar.LocalSparseFileDir, types.GlobalConfigVar.LocalSparseFileTempSize)
+		if err != nil {
+			log.Errorf("NewNodeServer: failed to create template sparsefile. err: %v", err)
 		}
+		lpTemplateFile = filepath.Join(types.GlobalConfigVar.LocalSparseFileDir, manager.LOCAL_SPARSE_TEMPLATE_NAME)
+	}
+
+	// local volume daemon
+	// GRPC server to provide volume manage
+	ch := make(chan bool)
+	go server.Start(types.GlobalConfigVar.KubeClient, ch, lpTemplateFile)
+	<-ch
+	// pv handler
+	// watch pv/pvc annotations and provide volume manage
+	go generator.VolumeHandler()
+
+	// maintain pmem node
+	if types.GlobalConfigVar.PmemEnable {
+		manager.MaintainPMEM(types.GlobalConfigVar.PmemType, mounter)
+	}
+
+	// Update Local Storage capacity to Node
+	if types.GlobalConfigVar.CapacityToNode {
+		go updateNodeCapacity()
 	}
 
 	return &nodeServer{
 		DefaultNodeServer: csicommon.NewDefaultNodeServer(d),
+		SparseFileDir:     types.GlobalConfigVar.LocalSparseFileDir,
 		nodeID:            nodeID,
 		mounter:           utils.NewMounter(),
 		k8smounter:        mounter,
-		client:            kubeClient,
+		client:            types.GlobalConfigVar.KubeClient,
 		driverName:        dName,
 	}
 }
@@ -163,6 +163,12 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 			log.Errorf("NodePublishVolume: local volume %s mkdir target path %s with error: %s", req.VolumeId, targetPath, err.Error())
 			return nil, status.Errorf(codes.Internal, "NodePublishVolume: local volume %s mkdir target path %s with error: %s", req.VolumeId, targetPath, err.Error())
 		}
+	}
+
+	if valid, err := utils.ValidateRequest(req.VolumeContext); !valid {
+		msg := fmt.Sprintf("NodePublishVolume: failed to check request args: %v", err)
+		log.Infof(msg)
+		return nil, status.Error(codes.InvalidArgument, msg)
 	}
 
 	volumeType := ""
@@ -195,10 +201,11 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 			log.Errorf("NodePublishVolume: mount pmem volume %s with path %s with error: %v", req.VolumeId, targetPath, err)
 			return nil, err
 		}
-	case QuotaPathVolumeType:
-		err := ns.mountQuotaPathVolume(ctx, req)
+	case LoopDeviceVolumeType:
+		lp := manager.NewLoopDevice(types.GlobalConfigVar.LocalSparseFileDir, types.GlobalConfigVar.LocalSparseFileTempSize)
+		err := ns.mountLoopDeviceVolume(ctx, req, lp)
 		if err != nil {
-			log.Errorf("NodePublishVolume: mount quotapath volume %s with path %s with error: %v", req.VolumeId, targetPath, err)
+			log.Errorf("NodePublishVolume: mount loopdevice volume %s with path %s with error: %v", req.VolumeId, targetPath, err)
 			return nil, err
 		}
 	default:
@@ -213,7 +220,7 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 	targetPath := req.GetTargetPath()
 	log.Infof("NodeUnpublishVolume: Starting to unmount target path %s for volume %s", targetPath, req.VolumeId)
 
-	isMnt, err := ns.mounter.IsMounted(targetPath)
+	isNotMnt, err := ns.mounter.IsNotMountPoint(targetPath)
 	if err != nil {
 		if _, err := os.Stat(targetPath); os.IsNotExist(err) {
 			log.Infof("NodeUnpublishVolume: Target path not exist for volume %s with path %s", req.VolumeId, targetPath)
@@ -222,7 +229,7 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 		log.Errorf("NodeUnpublishVolume: Stat volume %s at path %s with error %v", req.VolumeId, targetPath, err)
 		return nil, status.Error(codes.Internal, err.Error())
 	}
-	if !isMnt {
+	if isNotMnt {
 		log.Infof("NodeUnpublishVolume: Target path %s not mounted for volume %s", targetPath, req.VolumeId)
 		return &csi.NodeUnpublishVolumeResponse{}, nil
 	}
@@ -233,8 +240,8 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
-	isMnt, err = ns.mounter.IsMounted(targetPath)
-	if isMnt {
+	isNotMnt, err = ns.mounter.IsNotMountPoint(targetPath)
+	if !isNotMnt {
 		log.Errorf("NodeUnpublishVolume: Umount volume %s for path %s not successful", req.VolumeId, targetPath)
 		return nil, status.Error(codes.Internal, fmt.Sprintf("Umount volume %s not successful", req.VolumeId))
 	}
@@ -355,6 +362,19 @@ func (ns *nodeServer) resizeVolume(ctx context.Context, expectSize int64, volume
 	case PmemVolumeType:
 		log.Warnf("NodeExpandVolume: %s not support volume expand", volumeType)
 		return nil
+	case LoopDeviceVolumeType:
+		lp := manager.NewLoopDevice(types.GlobalConfigVar.LocalSparseFileDir, types.GlobalConfigVar.LocalSparseFileTempSize)
+		lpPath := filepath.Join(ns.SparseFileDir, fmt.Sprintf("%s.img", volumeID))
+		err := lp.CreateSparseFile(lpPath, strconv.Itoa(int(expectSize)))
+		if err != nil {
+			log.Errorf("NodeExpandVolume: failed to expand img file. err: %s", err.Error())
+			return status.Errorf(codes.Internal, "resizeVolume:: failed to expand img file err: %s", err.Error())
+		}
+		err = lp.ResizeLoopDevice(lpPath)
+		if err != nil {
+			log.Errorf("NodeExpandVolume: failed to expand loopdevice. err: %s", err.Error())
+			return status.Errorf(codes.Internal, "resizeVolume:: failed to expand loopdevice err: %s", err.Error())
+		}
 	case QuotaPathVolumeType:
 		if quotaFullPath, ok := pv.Spec.CSI.VolumeAttributes[ProjQuotaFullPath]; ok {
 			kSize := strconv.Itoa(int(expectSize / 1024))
@@ -407,15 +427,18 @@ func (ns *nodeServer) resizeVolume(ctx context.Context, expectSize int64, volume
 		}
 
 		// use resizer to expand volume filesystem
-		resizer := resizefs.NewResizeFs(&k8smount.SafeFormatAndMount{Interface: ns.k8smounter, Exec: utilexec.New()})
-		ok, err := resizer.Resize(devicePath, targetPath)
+		mounter := &k8smount.SafeFormatAndMount{Interface: ns.k8smounter, Exec: utilexec.New()}
+		r := k8smount.NewResizeFs(mounter.Exec)
+		needResize, err := r.NeedResize(devicePath, targetPath)
 		if err != nil {
-			log.Errorf("NodeExpandVolume:: Lvm Resize Error, volumeId: %s, devicePath: %s, volumePath: %s, err: %s", volumeID, devicePath, targetPath, err.Error())
+			log.Errorf("NodeExpandVolume:: get need resize error, volumeId: %s, devicePath: %s, volumePath: %s, err: %s", volumeID, devicePath, targetPath, err.Error())
 			return err
 		}
-		if !ok {
-			log.Errorf("NodeExpandVolume:: Lvm Resize failed, volumeId: %s, devicePath: %s, volumePath: %s", volumeID, devicePath, targetPath)
-			return status.Error(codes.Internal, "Fail to resize volume fs")
+		if needResize {
+			log.Infof("NodeExpandVolume: Resizing volume %q created from a snapshot/volume", volumeID)
+			if _, err := r.Resize(devicePath, targetPath); err != nil {
+				return err
+			}
 		}
 		log.Infof("NodeExpandVolume:: lvm resizefs successful volumeId: %s, devicePath: %s, volumePath: %s", volumeID, devicePath, targetPath)
 		return nil

@@ -17,6 +17,7 @@ limitations under the License.
 package disk
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -25,16 +26,13 @@ import (
 
 	"github.com/aliyun/alibaba-cloud-sdk-go/services/ecs"
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"github.com/kubernetes-csi/drivers/pkg/csi-common"
+	csicommon "github.com/kubernetes-csi/drivers/pkg/csi-common"
+	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/log"
 	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/utils"
-	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	v1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/clientcmd"
 	k8smount "k8s.io/mount-utils"
 	utilexec "k8s.io/utils/exec"
 )
@@ -112,6 +110,8 @@ const (
 	MaxVolumesPerNode = 15
 	// NOUUID is xfs fs mount opts
 	NOUUID = "nouuid"
+	// NodeMultiZoneEnable Enable node multi-zone mode
+	NodeMultiZoneEnable = "NODE_MULTI_ZONE_ENABLE"
 )
 
 var (
@@ -135,13 +135,13 @@ func NewNodeServer(d *csicommon.CSIDriver, c *ecs.Client) csi.NodeServer {
 	if "" != volumeNum {
 		num, err := strconv.ParseInt(volumeNum, 10, 64)
 		if err != nil {
-			log.Fatalf("NewNodeServer: MAX_VOLUMES_PERNODE must be int64, but get: %s", volumeNum)
+			log.Log.Fatalf("NewNodeServer: MAX_VOLUMES_PERNODE must be int64, but get: %s", volumeNum)
 		} else {
 			if num < 0 || num > 64 {
-				log.Errorf("NewNodeServer: MAX_VOLUMES_PERNODE must between 0-15, but get: %s", volumeNum)
+				log.Log.Errorf("NewNodeServer: MAX_VOLUMES_PERNODE must between 0-15, but get: %s", volumeNum)
 			} else {
 				maxVolumesNum = num
-				log.Infof("NewNodeServer: MAX_VOLUMES_PERNODE is set to(not default): %d", maxVolumesNum)
+				log.Log.Infof("NewNodeServer: MAX_VOLUMES_PERNODE is set to(not default): %d", maxVolumesNum)
 			}
 		}
 	} else {
@@ -154,21 +154,20 @@ func NewNodeServer(d *csicommon.CSIDriver, c *ecs.Client) csi.NodeServer {
 	if internalMode == "true" {
 		zoneID, nodeID = getZoneID(c, nodeID)
 	} else {
-		doc, err := getInstanceDoc()
-		if err != nil {
-			log.Fatalf("Error happens to get node document: %v", err)
+		doc, err := retryGetInstanceDoc()
+		if err != nil || doc == nil || (doc != nil && doc.ZoneID == "") {
+			// these branch means metadata server is down, when nodeID equals nodeName, we can get nessary message from apiserver
+			log.Log.Infof("NewNodeServer: get instance meta info failed from metadataserver, start to get info from node labels")
+			zoneID, nodeID = getZoneID(c, nodeID)
+		} else {
+			zoneID = doc.ZoneID
+			nodeID = doc.InstanceID
 		}
-		zoneID = doc.ZoneID
-		nodeID = doc.InstanceID
 	}
-
-	cfg, err := clientcmd.BuildConfigFromFlags(masterURL, kubeconfig)
-	if err != nil {
-		log.Fatalf("Error building kubeconfig: %s", err.Error())
-	}
-	kubeClient, err := kubernetes.NewForConfig(cfg)
-	if err != nil {
-		log.Fatalf("Error building kubernetes clientset: %s", err.Error())
+	log.Log.Infof("NewNodeServer: zone id: %+v, GlobalConfigVar.zoneID: %s", zoneID, GlobalConfigVar.ZoneID)
+	// !strings.HasPrefix(zoneID, GlobalConfigVar.Region) is forbidden ex: regionId: ap-southeast-1 zoneId: ap-southeast-x
+	if GlobalConfigVar.ZoneID == "" {
+		GlobalConfigVar.ZoneID = zoneID
 	}
 
 	// Create Directory
@@ -177,24 +176,24 @@ func NewNodeServer(d *csicommon.CSIDriver, c *ecs.Client) csi.NodeServer {
 	os.MkdirAll(RundSocketDir, os.FileMode(0755))
 
 	if IsVFNode() {
-		log.Infof("Currently node is VF model")
+		log.Log.Infof("Currently node is VF model")
 	} else {
-		log.Infof("Currently node is NOT VF model")
+		log.Log.Infof("Currently node is NOT VF model")
 	}
-	go UpdateNode(nodeID, kubeClient, c)
+	go UpdateNode(nodeID, c)
 
 	if !GlobalConfigVar.ControllerService && IsVFNode() && GlobalConfigVar.BdfHealthCheck {
 		go BdfHealthCheck()
 	}
 
 	return &nodeServer{
-		zone:              zoneID,
+		zone:              GlobalConfigVar.ZoneID,
 		maxVolumesPerNode: maxVolumesNum,
 		nodeID:            nodeID,
 		DefaultNodeServer: csicommon.NewDefaultNodeServer(d),
 		mounter:           utils.NewMounter(),
 		k8smounter:        k8smount.New(""),
-		clientSet:         kubeClient,
+		clientSet:         GlobalConfigVar.ClientSet,
 	}
 }
 
@@ -237,11 +236,18 @@ func (ns *nodeServer) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetC
 func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
 	// check target mount path
 	sourcePath := req.StagingTargetPath
+
+	if valid, err := utils.ValidateRequest(req.VolumeContext); !valid {
+		msg := fmt.Sprintf("NodePublishVolume: failed to check request args: %v", err)
+		log.Log.Errorf(msg)
+		return nil, status.Error(codes.InvalidArgument, msg)
+	}
+
 	// running in runc/runv mode
 	if GlobalConfigVar.RunTimeClass == MixRunTimeMode {
 		// if target path mounted already, return
 		if utils.IsMounted(req.TargetPath) {
-			log.Infof("NodePublishVolume: TargetPath(%s) is mounted, not need mount again", req.TargetPath)
+			log.Log.Infof("NodePublishVolume: TargetPath(%s) is mounted, not need mount again", req.TargetPath)
 			return &csi.NodePublishVolumeResponse{}, nil
 		}
 
@@ -249,25 +255,26 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		if runtime, err := utils.GetPodRunTime(req, ns.clientSet); err != nil {
 			return nil, status.Errorf(codes.Internal, "NodePublishVolume: cannot get pod runtime: %v", err)
 		} else if runtime == RunvRunTimeMode {
-			log.Infof("NodePublishVolume:: Kata Disk Volume %s Mount with: %v", req.VolumeId, req)
+			log.Log.Infof("NodePublishVolume:: Kata Disk Volume %s Mount with: %v", req.VolumeId, req)
 			// umount the stage path, which is mounted in Stage
 			if err := ns.unmountStageTarget(sourcePath); err != nil {
-				log.Errorf("NodePublishVolume(runv): unmountStageTarget %s with error: %s", sourcePath, err.Error())
+				log.Log.Errorf("NodePublishVolume(runv): unmountStageTarget %s with error: %s", sourcePath, err.Error())
 				return nil, status.Error(codes.InvalidArgument, "NodePublishVolume: unmountStageTarget "+sourcePath+" with error: "+err.Error())
 			}
-			deviceName, err := GetDeviceByVolumeID(req.VolumeId)
-			if err != nil && deviceName == "" {
+			devicePaths, err := GetDeviceByVolumeID(req.VolumeId)
+			deviceName, _, err := GetRootSubDevicePath(devicePaths)
+			if err != nil && len(devicePaths) == 0 {
 				deviceName = getVolumeConfig(req.VolumeId)
 			}
 			if deviceName == "" {
-				log.Errorf("NodePublishVolume(runv): cannot get local deviceName for volume:  %s", req.VolumeId)
+				log.Log.Errorf("NodePublishVolume(runv): cannot get local deviceName for volume:  %s", req.VolumeId)
 				return nil, status.Error(codes.InvalidArgument, "NodePublishVolume: cannot get local deviceName for volume: "+req.VolumeId)
 			}
 
 			// save volume info to local file
 			mountFile := filepath.Join(req.GetTargetPath(), utils.CsiPluginRunTimeFlagFile)
 			if err := utils.CreateDest(req.GetTargetPath()); err != nil {
-				log.Errorf("NodePublishVolume(runv): Create Dest %s error: %s", req.GetTargetPath(), err.Error())
+				log.Log.Errorf("NodePublishVolume(runv): Create Dest %s error: %s", req.GetTargetPath(), err.Error())
 				return nil, status.Error(codes.InvalidArgument, "NodePublishVolume(runv): Create Dest "+req.GetTargetPath()+" with error: "+err.Error())
 			}
 
@@ -277,12 +284,22 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 			qResponse.volumeType = "block"
 			qResponse.mountfile = mountFile
 			qResponse.runtime = RunvRunTimeMode
-			if err := utils.WriteJosnFile(qResponse, mountFile); err != nil {
-				log.Errorf("NodePublishVolume(runv): Write Josn File error: %s", err.Error())
-				return nil, status.Error(codes.InvalidArgument, "NodePublishVolume(runv): Write Josn File error: "+err.Error())
+			if err := utils.WriteJSONFile(qResponse, mountFile); err != nil {
+				log.Log.Errorf("NodePublishVolume(runv): Write Json File error: %s", err.Error())
+				return nil, status.Error(codes.InvalidArgument, "NodePublishVolume(runv): Write Json File error: "+err.Error())
+			}
+			// save volume status to stage json file
+			volumeStatus := map[string]string{}
+			volumeStatus["csi.alibabacloud.com/disk-mounted"] = "true"
+			fileName := filepath.Join(filepath.Dir(sourcePath), utils.VolDataFileName)
+			if strings.HasSuffix(sourcePath, "/") {
+				fileName = filepath.Join(filepath.Dir(filepath.Dir(sourcePath)), utils.VolDataFileName)
+			}
+			if err = utils.AppendJSONData(fileName, volumeStatus); err != nil {
+				log.Log.Warnf("NodePublishVolume: append kata volume attached info to %s with error: %s", fileName, err.Error())
 			}
 
-			log.Infof("NodePublishVolume:: Kata Disk Volume %s Mount Successful", req.VolumeId)
+			log.Log.Infof("NodePublishVolume:: Kata Disk Volume %s Mount Successful", req.VolumeId)
 			return &csi.NodePublishVolumeResponse{}, nil
 		}
 	}
@@ -292,7 +309,7 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		sourcePath = filepath.Join(req.StagingTargetPath, req.VolumeId)
 	}
 	targetPath := req.GetTargetPath()
-	log.Infof("NodePublishVolume: Starting Mount Volume %s, source %s > target %s", req.VolumeId, sourcePath, targetPath)
+	log.Log.Infof("NodePublishVolume: Starting Mount Volume %s, source %s > target %s", req.VolumeId, sourcePath, targetPath)
 	if req.VolumeId == "" {
 		return nil, status.Error(codes.InvalidArgument, "NodePublishVolume: Volume ID must be provided")
 	}
@@ -313,7 +330,7 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 				return nil, err
 			}
 		}
-		log.Infof("NodePublishVolume: Mount Successful Block Volume: %s, from source %s to target %v", req.VolumeId, sourcePath, targetPath)
+		log.Log.Infof("NodePublishVolume: Mount Successful Block Volume: %s, from source %s to target %v", req.VolumeId, sourcePath, targetPath)
 		return &csi.NodePublishVolumeResponse{}, nil
 	}
 
@@ -321,16 +338,16 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		return nil, status.Errorf(codes.InvalidArgument, "NodePublishVolume: volume %s malformed the value of target path: %s", req.VolumeId, targetPath)
 	}
 	if err := ns.mounter.EnsureFolder(targetPath); err != nil {
-		log.Errorf("NodePublishVolume: create volume %s path %s error: %v", req.VolumeId, targetPath, err)
+		log.Log.Errorf("NodePublishVolume: create volume %s path %s error: %v", req.VolumeId, targetPath, err)
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	notmounted, err := ns.k8smounter.IsLikelyNotMountPoint(targetPath)
 	if err != nil {
-		log.Errorf("NodePublishVolume: check volume %s target path %s error: %v", req.VolumeId, targetPath, err)
+		log.Log.Errorf("NodePublishVolume: check volume %s target path %s error: %v", req.VolumeId, targetPath, err)
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	if !notmounted {
-		log.Infof("NodePublishVolume: VolumeId: %s, Path %s is already mounted", req.VolumeId, targetPath)
+		log.Log.Infof("NodePublishVolume: VolumeId: %s, Path %s is already mounted", req.VolumeId, targetPath)
 		return &csi.NodePublishVolumeResponse{}, nil
 	}
 
@@ -339,15 +356,17 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	if sourceNotMounted {
-		device, _ := GetDeviceByVolumeID(req.GetVolumeId())
-		if device != "" {
+		devicePaths, getDeviceErr := GetDeviceByVolumeID(req.GetVolumeId())
+		rootDevice, subDevice, chooseDeviceErr := GetRootSubDevicePath(devicePaths)
+		if getDeviceErr == nil && chooseDeviceErr == nil {
+			device := ChooseDevice(rootDevice, subDevice)
 			if err := ns.mountDeviceToGlobal(req.VolumeCapability, req.VolumeContext, device, sourcePath); err != nil {
-				log.Errorf("NodePublishVolume: VolumeId: %s, remount disk to global %s error: %s", req.VolumeId, sourcePath, err.Error())
+				log.Log.Errorf("NodePublishVolume: VolumeId: %s, remount disk to global %s error: %s", req.VolumeId, sourcePath, err.Error())
 				return nil, status.Error(codes.Internal, "NodePublishVolume: VolumeId: %s, remount disk error "+err.Error())
 			}
-			log.Infof("NodePublishVolume: SourcePath %s not mounted, and mounted again with device %s", sourcePath, device)
+			log.Log.Infof("NodePublishVolume: SourcePath %s not mounted, and mounted again with device %s", sourcePath, device)
 		} else {
-			log.Errorf("NodePublishVolume: VolumeId: %s, sourcePath %s is Not mounted and device cannot found", req.VolumeId, sourcePath)
+			log.Log.Errorf("NodePublishVolume: VolumeId: %s, sourcePath %s is Not mounted and device cannot found, getDeviceErr: %v, chooseDeviceErr: %v", req.VolumeId, sourcePath, getDeviceErr, chooseDeviceErr)
 			return nil, status.Error(codes.Internal, "NodePublishVolume: VolumeId: %s, sourcePath %s is Not mounted "+sourcePath)
 		}
 	}
@@ -355,6 +374,7 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	// start to mount
 	mnt := req.VolumeCapability.GetMount()
 	options := append(mnt.MountFlags, "bind")
+	log.Log.Infof("NodePublishVolume: VolumeCapability.MountFlags: %+v, req.ReadOnly: %+v", mnt.MountFlags, req.Readonly)
 	if req.Readonly {
 		options = append(options, "ro")
 	}
@@ -364,39 +384,69 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	}
 
 	// check device name available
-	expectName := GetVolumeDeviceName(req.VolumeId)
+	devicePaths := GetVolumeDeviceName(req.VolumeId)
+	rootDevice, subDevice, err := GetRootSubDevicePath(devicePaths)
+	expectName := ChooseDevice(rootDevice, subDevice)
 	realDevice := GetDeviceByMntPoint(sourcePath)
 	if realDevice == "" {
 		opts := append(mnt.MountFlags, "shared")
 		if err := ns.k8smounter.Mount(expectName, sourcePath, fsType, opts); err != nil {
-			log.Errorf("NodePublishVolume: mount source error: %s, %s, %s", expectName, sourcePath, err.Error())
+			log.Log.Errorf("NodePublishVolume: mount source error: %s, %s, %s", expectName, sourcePath, err.Error())
 			return nil, status.Error(codes.Internal, "NodePublishVolume: mount source error: "+expectName+", "+sourcePath+", "+err.Error())
 		}
 		realDevice = GetDeviceByMntPoint(sourcePath)
 	}
 	if expectName != realDevice || realDevice == "" {
-		log.Errorf("NodePublishVolume: Volume: %s, sourcePath: %s real Device: %s not same with expected: %s", req.VolumeId, sourcePath, realDevice, expectName)
+		log.Log.Errorf("NodePublishVolume: Volume: %s, sourcePath: %s real Device: %s not same with expected: %s", req.VolumeId, sourcePath, realDevice, expectName)
 		return nil, status.Error(codes.Internal, "NodePublishVolume: sourcePath: "+sourcePath+" real Device: "+realDevice+" not same with Saved: "+expectName)
 	}
 
-	log.Infof("NodePublishVolume: Starting mount volume %s with flags %v and fsType %s", req.VolumeId, options, fsType)
+	log.Log.Infof("NodePublishVolume: Starting mount volume %s with flags %v and fsType %s", req.VolumeId, options, fsType)
 	if err = ns.k8smounter.Mount(sourcePath, targetPath, fsType, options); err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
-	log.Infof("NodePublishVolume: Mount Successful Volume: %s, from source %s to target %v", req.VolumeId, sourcePath, targetPath)
+	if utils.IsKataInstall() {
+		// save volume data to json file
+		volumeData := map[string]string{}
+		volumeData["csi.alibabacloud.com/fsType"] = fsType
+		saveOptions := req.VolumeCapability.GetMount().MountFlags
+		if len(saveOptions) != 0 {
+			volumeData["csi.alibabacloud.com/mountOptions"] = strings.Join(saveOptions, ",")
+		}
+		if value, ok := req.VolumeContext[MkfsOptions]; ok {
+			volumeData["csi.alibabacloud.com/mkfsOptions"] = value
+		}
+		volumeData["csi.alibabacloud.com/disk-mounted"] = "true"
+		fileName := filepath.Join(filepath.Dir(targetPath), utils.VolDataFileName)
+		if strings.HasSuffix(targetPath, "/") {
+			fileName = filepath.Join(filepath.Dir(filepath.Dir(targetPath)), utils.VolDataFileName)
+		}
+		if err = utils.AppendJSONData(fileName, volumeData); err != nil {
+			log.Log.Warnf("NodeStageVolume: append volume spec to %s with error: %s", fileName, err.Error())
+		}
+	}
+
+	// Set volume IO Limit
+	err = utils.SetVolumeIOLimit(realDevice, req)
+	if err != nil {
+		log.Log.Errorf("NodePublishVolume: Set Disk Volume(%s) IO Limit with Error: %s", req.VolumeId, err.Error())
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	log.Log.Infof("NodePublishVolume: Mount Successful Volume: %s, from source %s to target %v", req.VolumeId, sourcePath, targetPath)
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
 func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
 	targetPath := req.GetTargetPath()
-	log.Infof("NodeUnpublishVolume: Starting to Unmount Volume %s, Target %v", req.VolumeId, targetPath)
+	log.Log.Infof("NodeUnpublishVolume: Starting to Unmount Volume %s, Target %v", req.VolumeId, targetPath)
 	// Step 1: check folder exists
 	if !IsFileExisting(targetPath) {
-		if err := ns.unmountDuplicateMountPoint(targetPath); err != nil {
+		if err := ns.unmountDuplicateMountPoint(targetPath, req.VolumeId); err != nil {
 			return nil, status.Error(codes.Internal, err.Error())
 		}
-		log.Infof("NodeUnpublishVolume: Volume %s Folder %s doesn't exist", req.VolumeId, targetPath)
+		log.Log.Infof("NodeUnpublishVolume: Volume %s Folder %s doesn't exist", req.VolumeId, targetPath)
 		return &csi.NodeUnpublishVolumeResponse{}, nil
 	}
 
@@ -407,7 +457,7 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 			msg := fmt.Sprintf("NodeUnpublishVolume: Remove Runv File %s with error: %s", fileName, err.Error())
 			return nil, status.Error(codes.InvalidArgument, msg)
 		}
-		log.Infof("NodeUnpublishVolume(runv): Remove Runv File Successful: %s", fileName)
+		log.Log.Infof("NodeUnpublishVolume(runv): Remove Runv File Successful: %s", fileName)
 		return &csi.NodeUnpublishVolumeResponse{}, nil
 	}
 	// Step 2: check mount point
@@ -417,48 +467,54 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 	}
 	if notmounted {
 		if empty, _ := IsDirEmpty(targetPath); empty {
-			if err := ns.unmountDuplicateMountPoint(targetPath); err != nil {
+			if err := ns.unmountDuplicateMountPoint(targetPath, req.VolumeId); err != nil {
 				return nil, status.Error(codes.Internal, err.Error())
 			}
-			log.Infof("NodeUnpublishVolume: %s is unmounted and empty", targetPath)
+			log.Log.Infof("NodeUnpublishVolume: %s is unmounted and empty", targetPath)
 			return &csi.NodeUnpublishVolumeResponse{}, nil
 		}
 		// Block device
 		if !utils.IsDir(targetPath) && strings.HasPrefix(targetPath, BLOCKVOLUMEPREFIX) {
 			if removeErr := os.Remove(targetPath); removeErr != nil {
-				log.Errorf("NodeUnpublishVolume: VolumeId: %s, Could not remove mount block target %s with error %v", req.VolumeId, targetPath, removeErr)
+				log.Log.Errorf("NodeUnpublishVolume: VolumeId: %s, Could not remove mount block target %s with error %v", req.VolumeId, targetPath, removeErr)
 				return nil, status.Errorf(codes.Internal, "Could not remove mount block target %s: %v", targetPath, removeErr)
 			}
-			log.Infof("NodeUnpublishVolume: %s is block volume and is removed successful", targetPath)
+			log.Log.Infof("NodeUnpublishVolume: %s is block volume and is removed successful", targetPath)
 			return &csi.NodeUnpublishVolumeResponse{}, nil
 		}
-		log.Errorf("NodeUnpublishVolume: VolumeId: %s, Path %s is unmounted, but not empty dir", req.VolumeId, targetPath)
+		log.Log.Errorf("NodeUnpublishVolume: VolumeId: %s, Path %s is unmounted, but not empty dir", req.VolumeId, targetPath)
 		return nil, status.Errorf(codes.Internal, "NodeUnpublishVolume: VolumeId: %s, Path %s is unmounted, but not empty dir", req.VolumeId, targetPath)
 	}
 
 	// Step 3: umount target path
 	err = ns.k8smounter.Unmount(targetPath)
 	if err != nil {
-		log.Errorf("NodeUnpublishVolume: volumeId: %s, umount path: %s with error: %s", req.VolumeId, targetPath, err.Error())
+		log.Log.Errorf("NodeUnpublishVolume: volumeId: %s, umount path: %s with error: %s", req.VolumeId, targetPath, err.Error())
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	if utils.IsMounted(targetPath) {
-		log.Errorf("NodeUnpublishVolume: TargetPath mounted yet, volumeId %s with target %s", req.VolumeId, targetPath)
+		log.Log.Errorf("NodeUnpublishVolume: TargetPath mounted yet, volumeId %s with target %s", req.VolumeId, targetPath)
 		return nil, status.Error(codes.Internal, "NodeUnpublishVolume: TargetPath mounted yet with target "+targetPath)
 	}
 
 	// below directory can not be umounted by kubelet in ack
-	if err := ns.unmountDuplicateMountPoint(targetPath); err != nil {
-		log.Errorf("NodeUnpublishVolume: umount duplicate mountpoint %s with error: %v", targetPath, err)
+	if err := ns.unmountDuplicateMountPoint(targetPath, req.VolumeId); err != nil {
+		log.Log.Errorf("NodeUnpublishVolume: umount duplicate mountpoint %s with error: %v", targetPath, err)
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
-	log.Infof("NodeUnpublishVolume: Umount Successful for volume %s, target %v", req.VolumeId, targetPath)
+	log.Log.Infof("NodeUnpublishVolume: Umount Successful for volume %s, target %v", req.VolumeId, targetPath)
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
 func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
-	log.Infof("NodeStageVolume: Stage VolumeId: %s, Target Path: %s, VolumeContext: %v", req.GetVolumeId(), req.StagingTargetPath, req.VolumeContext)
+	log.Log.Infof("NodeStageVolume: Stage VolumeId: %s, Target Path: %s, VolumeContext: %v", req.GetVolumeId(), req.StagingTargetPath, req.VolumeContext)
+
+	if valid, err := utils.ValidateRequest(req.VolumeContext); !valid {
+		msg := fmt.Sprintf("NodeStageVolume: failed to check request parameters: %v", err)
+		log.Log.Errorf(msg)
+		return nil, status.Error(codes.InvalidArgument, msg)
+	}
 
 	// Step 1: check input parameters
 	targetPath := req.StagingTargetPath
@@ -477,40 +533,47 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	if isBlock {
 		targetPath = filepath.Join(targetPath, req.VolumeId)
 		if utils.IsMounted(targetPath) {
-			log.Infof("NodeStageVolume: Block Already Mounted: volumeId: %s target %s", req.VolumeId, targetPath)
+			log.Log.Infof("NodeStageVolume: Block Already Mounted: volumeId: %s target %s", req.VolumeId, targetPath)
 			return &csi.NodeStageVolumeResponse{}, nil
 		}
 		if err := ns.mounter.EnsureBlock(targetPath); err != nil {
-			log.Errorf("NodeStageVolume: create block volume %s path %s error: %v", req.VolumeId, targetPath, err)
+			log.Log.Errorf("NodeStageVolume: create block volume %s path %s error: %v", req.VolumeId, targetPath, err)
 			return nil, status.Error(codes.Internal, err.Error())
 		}
 	} else {
 		if err := ns.mounter.EnsureFolder(targetPath); err != nil {
-			log.Errorf("NodeStageVolume: create volume %s path %s error: %v", req.VolumeId, targetPath, err)
+			log.Log.Errorf("NodeStageVolume: create volume %s path %s error: %v", req.VolumeId, targetPath, err)
 			return nil, status.Error(codes.Internal, err.Error())
 		}
 	}
-
-	// Step 2: check target path mounted
-	notmounted, err := ns.k8smounter.IsLikelyNotMountPoint(targetPath)
-	if err != nil {
-		log.Errorf("NodeStageVolume: check volume %s path %s error: %v", req.VolumeId, targetPath, err)
-		return nil, status.Error(codes.Internal, err.Error())
+	// check volume is mounted in kata mode;
+	fileName := filepath.Join(filepath.Dir(targetPath), utils.VolDataFileName)
+	if strings.HasSuffix(targetPath, "/") {
+		fileName = filepath.Join(filepath.Dir(filepath.Dir(targetPath)), utils.VolDataFileName)
 	}
-	if !notmounted {
-		// if target path is mounted tmpfs, return
-		if utils.IsDirTmpfs(req.StagingTargetPath) {
-			log.Infof("NodeStageVolume: TargetPath(%s) is mounted as tmpfs, not need mount again", req.StagingTargetPath)
+	volumeData, err := utils.LoadJSONData(fileName)
+	if err == nil {
+		if _, ok := volumeData["csi.alibabacloud.com/disk-mounted"]; ok {
+			log.Log.Infof("NodeStageVolume:  volumeId: %s, Path: %s is already mounted in kata mode", req.VolumeId, targetPath)
 			return &csi.NodeStageVolumeResponse{}, nil
 		}
+	}
 
-		// check device avaliable
-		deviceName := GetDeviceByMntPoint(targetPath)
-		if err := checkDeviceAvailable(deviceName, req.VolumeId, targetPath); err != nil {
-			log.Errorf("NodeStageVolume: mountPath is mounted %s, but check device available error: %s", targetPath, err.Error())
-			return nil, status.Error(codes.Internal, err.Error())
-		}
-		log.Infof("NodeStageVolume:  volumeId: %s, Path: %s is already mounted, device: %s", req.VolumeId, targetPath, deviceName)
+	// Step 1: check oldVersion volumeMount
+	oldTargetPath := fmt.Sprintf("/var/lib/kubelet/plugins/kubernetes.io/csi/pv/%s/globalmount", req.VolumeId)
+	returned, err := ns.checkStagingPathMounted(req.VolumeId, oldTargetPath, targetPath)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	if returned {
+		return &csi.NodeStageVolumeResponse{}, nil
+	}
+	// Step 2: check target path mounted
+	returned, err = ns.checkStagingPathMounted(req.VolumeId, targetPath, targetPath)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	if returned {
 		return &csi.NodeStageVolumeResponse{}, nil
 	}
 
@@ -522,45 +585,59 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 			isSharedDisk = true
 		}
 	}
+	isMultiAttach := false
+	if value, ok := req.VolumeContext[MultiAttach]; ok {
+		value = strings.ToLower(value)
+		if checkOption(value) {
+			isMultiAttach = true
+		}
+	}
 
 	// Step 4 Attach volume
-	if GlobalConfigVar.ADControllerEnable {
+	if GlobalConfigVar.ADControllerEnable || isMultiAttach {
 		var bdf string
-		device, err = GetDeviceByVolumeID(req.GetVolumeId())
-		if IsVFNode() && device == "" {
+		devicePaths, err := GetDeviceByVolumeID(req.GetVolumeId())
+		if IsVFNode() && len(devicePaths) == 0 {
 			if bdf, err = bindBdfDisk(req.GetVolumeId()); err != nil {
 				if err := unbindBdfDisk(req.GetVolumeId()); err != nil {
 					return nil, status.Errorf(codes.Aborted, "NodeStageVolume: failed to detach bdf disk: %v", err)
 				}
 				return nil, status.Errorf(codes.Aborted, "NodeStageVolume: failed to attach bdf disk: %v", err)
 			}
-			device, err = GetDeviceByVolumeID(req.GetVolumeId())
-			if bdf != "" && device == "" {
+			devicePaths, err = GetDeviceByVolumeID(req.GetVolumeId())
+			if bdf != "" && len(devicePaths) == 0 {
 				device, err = GetDeviceByBdf(bdf, true)
 			}
 		}
 		if err != nil {
-			log.Errorf("NodeStageVolume: ADController Enabled, but device can't be found in node: %s, error: %s", req.VolumeId, err.Error())
+			log.Log.Errorf("NodeStageVolume: ADController Enabled, but device can't be found in node: %s, error: %s", req.VolumeId, err.Error())
 			return nil, status.Error(codes.Aborted, "NodeStageVolume: ADController Enabled, but device can't be found:"+req.VolumeId+err.Error())
 		}
+
+		rootDevice, subDevice, err := GetRootSubDevicePath(devicePaths)
+		if err != nil {
+			log.Log.Errorf("NodeStageVolume: ADController Enabled, but device can't be found in node: %s, error: %s", req.VolumeId, err.Error())
+			return nil, status.Error(codes.Aborted, "NodeStageVolume: ADController Enabled, but device can't be found:"+req.VolumeId+err.Error())
+		}
+		device = ChooseDevice(rootDevice, subDevice)
 	} else {
 		device, err = attachDisk(req.VolumeContext[TenantUserUID], req.GetVolumeId(), ns.nodeID, isSharedDisk)
 		if err != nil {
 			fullErrorMessage := utils.FindSuggestionByErrorMessage(err.Error(), utils.DiskAttachDetach)
-			log.Errorf("NodeStageVolume: Attach volume: %s with error: %s", req.VolumeId, fullErrorMessage)
-			return nil, err
+			log.Log.Errorf("NodeStageVolume: Attach volume: %s with error: %s", req.VolumeId, fullErrorMessage)
+			return nil, status.Error(codes.Aborted, fmt.Sprintf("NodeStageVolume: Attach volume: %s with error: %+v", req.VolumeId, err))
 		}
 	}
 
 	if err := checkDeviceAvailable(device, req.VolumeId, targetPath); err != nil {
-		log.Errorf("NodeStageVolume: check device %s for volume %s with error: %s", device, req.VolumeId, err.Error())
+		log.Log.Errorf("NodeStageVolume: check device %s for volume %s with error: %s", device, req.VolumeId, err.Error())
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	if err := saveVolumeConfig(req.VolumeId, device); err != nil {
-		log.Errorf("NodeStageVolume: saveVolumeConfig %s for volume %s with error: %s", device, req.VolumeId, err.Error())
+		log.Log.Errorf("NodeStageVolume: saveVolumeConfig %s for volume %s with error: %s", device, req.VolumeId, err.Error())
 		return nil, status.Error(codes.Aborted, "NodeStageVolume: saveVolumeConfig for ("+req.VolumeId+device+") error with: "+err.Error())
 	}
-	log.Infof("NodeStageVolume: Volume Successful Attached: %s, to Node: %s, Device: %s", req.VolumeId, ns.nodeID, device)
+	log.Log.Infof("NodeStageVolume: Volume Successful Attached: %s, to Node: %s, Device: %s", req.VolumeId, ns.nodeID, device)
 
 	// sysConfig
 	if value, ok := req.VolumeContext[SysConfigTag]; ok {
@@ -571,12 +648,12 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 				fileName := filepath.Join("/sys/block/", filepath.Base(device), keyValue[0])
 				configCmd := "echo '" + keyValue[1] + "' > " + fileName
 				if _, err := utils.Run(configCmd); err != nil {
-					log.Errorf("NodeStageVolume: Volume Block System Config with cmd: %s, get error: %v", configCmd, err)
+					log.Log.Errorf("NodeStageVolume: Volume Block System Config with cmd: %s, get error: %v", configCmd, err)
 					return nil, status.Error(codes.Aborted, "NodeStageVolume: Volume Block System Config with cmd:"+configCmd+", error with: "+err.Error())
 				}
-				log.Infof("NodeStageVolume: Volume Block System Config Successful with command: %s, for volume: %v", configCmd, req.VolumeId)
+				log.Log.Infof("NodeStageVolume: Volume Block System Config Successful with command: %s, for volume: %v", configCmd, req.VolumeId)
 			} else {
-				log.Errorf("NodeStageVolume: Volume Block System Config with format error: %s", configStr)
+				log.Log.Errorf("NodeStageVolume: Volume Block System Config with format error: %s", configStr)
 				return nil, status.Error(codes.Aborted, "NodeStageVolume: Volume Block System Config with format error "+configStr)
 			}
 		}
@@ -585,14 +662,14 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	// Block volume not need to format
 	if isBlock {
 		if utils.IsMounted(targetPath) {
-			log.Infof("NodeStageVolume: Block Already Mounted: volumeId: %s with target %s", req.VolumeId, targetPath)
+			log.Log.Infof("NodeStageVolume: Block Already Mounted: volumeId: %s with target %s", req.VolumeId, targetPath)
 			return &csi.NodeStageVolumeResponse{}, nil
 		}
 		options := []string{"bind"}
 		if err := ns.mounter.MountBlock(device, targetPath, options...); err != nil {
 			return nil, status.Error(codes.Internal, err.Error())
 		}
-		log.Infof("NodeStageVolume: Successfully Mount Device %s to %s with options: %v", device, targetPath, options)
+		log.Log.Infof("NodeStageVolume: Successfully Mount Device %s to %s with options: %v", device, targetPath, options)
 		return &csi.NodeStageVolumeResponse{}, nil
 	}
 
@@ -617,32 +694,32 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	// do format-mount or mount
 	diskMounter := &k8smount.SafeFormatAndMount{Interface: ns.k8smounter, Exec: utilexec.New()}
 	if len(mkfsOptions) > 0 && (fsType == "ext4" || fsType == "ext3") {
-		if err := formatAndMount(diskMounter, device, targetPath, fsType, mkfsOptions, mountOptions); err != nil {
-			log.Errorf("Mountdevice: FormatAndMount fail with mkfsOptions %s, %s, %s, %s, %s with error: %s", device, targetPath, fsType, mkfsOptions, mountOptions, err.Error())
+		if err := utils.FormatAndMount(diskMounter, device, targetPath, fsType, mkfsOptions, mountOptions); err != nil {
+			log.Log.Errorf("Mountdevice: FormatAndMount fail with mkfsOptions %s, %s, %s, %s, %s with error: %s", device, targetPath, fsType, mkfsOptions, mountOptions, err.Error())
 			return nil, status.Error(codes.Internal, err.Error())
 		}
 	} else {
 		if err := diskMounter.FormatAndMount(device, targetPath, fsType, mountOptions); err != nil {
-			log.Errorf("NodeStageVolume: Volume: %s, Device: %s, FormatAndMount error: %s", req.VolumeId, device, err.Error())
+			log.Log.Errorf("NodeStageVolume: Volume: %s, Device: %s, FormatAndMount error: %s", req.VolumeId, device, err.Error())
 			return nil, status.Error(codes.Internal, err.Error())
 		}
 	}
-	log.Infof("NodeStageVolume: Mount Successful: volumeId: %s target %v, device: %s, mkfsOptions: %v, options: %v", req.VolumeId, targetPath, device, mkfsOptions, mountOptions)
-	pvc, err := ns.getPvcFromDiskId(req.VolumeId)
+	log.Log.Infof("NodeStageVolume: Mount Successful: volumeId: %s target %v, device: %s, mkfsOptions: %v, options: %v", req.VolumeId, targetPath, device, mkfsOptions, mountOptions)
+	_, pvc, err := getPvPvcFromDiskId(req.VolumeId)
 	if err != nil {
 		return &csi.NodeStageVolumeResponse{}, nil
 	}
 	if pvc.Spec.DataSource != nil {
-		log.Info("NodeStageVolume: pvc is created from snapshot, add resizefs check")
+		log.Log.Info("NodeStageVolume: pvc is created from snapshot, add resizefs check")
 		mounter := &k8smount.SafeFormatAndMount{Interface: ns.k8smounter, Exec: utilexec.New()}
 		r := k8smount.NewResizeFs(mounter.Exec)
 		needResize, err := r.NeedResize(device, targetPath)
 		if err != nil {
-			log.Infof("NodeStageVolume: Could not determine if volume %s need to be resized: %v", req.VolumeId, err)
+			log.Log.Infof("NodeStageVolume: Could not determine if volume %s need to be resized: %v", req.VolumeId, err)
 			return &csi.NodeStageVolumeResponse{}, nil
 		}
 		if needResize {
-			log.Infof("NodeStageVolume: Resizing volume %q created from a snapshot/volume", req.VolumeId)
+			log.Log.Infof("NodeStageVolume: Resizing volume %q created from a snapshot/volume", req.VolumeId)
 			if _, err := r.Resize(device, targetPath); err != nil {
 				return nil, status.Errorf(codes.Internal, "Could not resize volume %s: %v", req.VolumeId, err)
 			}
@@ -653,7 +730,7 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 
 // target format: /var/lib/kubelet/plugins/kubernetes.io/csi/pv/pv-disk-1e7001e0-c54a-11e9-8f89-00163e0e78a0/globalmount
 func (ns *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
-	log.Infof("NodeUnstageVolume:: Starting to Unmount volume, volumeId: %s, target: %v", req.VolumeId, req.StagingTargetPath)
+	log.Log.Infof("NodeUnstageVolume:: Starting to Unmount volume, volumeId: %s, target: %v", req.VolumeId, req.StagingTargetPath)
 	if req.VolumeId == "" {
 		return nil, status.Error(codes.InvalidArgument, "NodeUnstageVolume Volume ID must be provided")
 	}
@@ -670,17 +747,17 @@ func (ns *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 			if strings.Contains(strings.ToLower(err.Error()), InputOutputErr) {
 				if err = isPathAvailiable(targetPath); err != nil {
 					if err = utils.Umount(targetPath); err != nil {
-						log.Errorf("NodeUnstageVolume: umount target %s(input/output error) with error: %v", targetPath, err)
+						log.Log.Errorf("NodeUnstageVolume: umount target %s(input/output error) with error: %v", targetPath, err)
 						return nil, status.Errorf(codes.InvalidArgument, "NodeUnstageVolume umount target %s with errror: %v", targetPath, err)
 					}
-					log.Warnf("NodeUnstageVolume: target path %s show input/output error: %v, umount it.", targetPath, err)
+					log.Log.Warnf("NodeUnstageVolume: target path %s show input/output error: %v, umount it.", targetPath, err)
 				}
 			} else {
-				log.Errorf("NodeUnstageVolume: lstat mountpoint: %s with error: %s", tmpPath, err.Error())
+				log.Log.Errorf("NodeUnstageVolume: lstat mountpoint: %s with error: %s", tmpPath, err.Error())
 				return nil, status.Error(codes.InvalidArgument, "NodeUnstageVolume: stat mountpoint error: "+err.Error())
 			}
 		} else if (fileInfo.Mode() & os.ModeDevice) != 0 {
-			log.Infof("NodeUnstageVolume: mountpoint %s, is block device", tmpPath)
+			log.Log.Infof("NodeUnstageVolume: mountpoint %s, is block device", tmpPath)
 			targetPath = tmpPath
 		}
 	}
@@ -690,17 +767,17 @@ func (ns *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 	if IsFileExisting(targetPath) {
 		notmounted, err := ns.k8smounter.IsLikelyNotMountPoint(targetPath)
 		if err != nil {
-			log.Errorf("NodeUnstageVolume: VolumeId: %s, check mountPoint: %s error: %v", req.VolumeId, targetPath, err)
+			log.Log.Errorf("NodeUnstageVolume: VolumeId: %s, check mountPoint: %s error: %v", req.VolumeId, targetPath, err)
 			return nil, status.Error(codes.Internal, err.Error())
 		}
 		if !notmounted {
 			err = ns.k8smounter.Unmount(targetPath)
 			if err != nil {
-				log.Errorf("NodeUnstageVolume: VolumeId: %s, umount path: %s failed with: %v", req.VolumeId, targetPath, err)
+				log.Log.Errorf("NodeUnstageVolume: VolumeId: %s, umount path: %s failed with: %v", req.VolumeId, targetPath, err)
 				return nil, status.Error(codes.Internal, err.Error())
 			}
 			if utils.IsMounted(targetPath) {
-				log.Errorf("NodeUnstageVolume: TargetPath mounted yet, volumeId: %s, Target: %s", req.VolumeId, targetPath)
+				log.Log.Errorf("NodeUnstageVolume: TargetPath mounted yet, volumeId: %s, Target: %s", req.VolumeId, targetPath)
 				return nil, status.Error(codes.Internal, "NodeUnstageVolume: TargetPath mounted yet with target"+targetPath)
 			}
 		} else {
@@ -709,7 +786,7 @@ func (ns *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 		// safe remove mountpoint
 		err = ns.mounter.SafePathRemove(targetPath)
 		if err != nil {
-			log.Errorf("NodeUnstageVolume: VolumeId: %s, Remove targetPath failed, target %v", req.VolumeId, targetPath)
+			log.Log.Errorf("NodeUnstageVolume: VolumeId: %s, Remove targetPath failed, target %v", req.VolumeId, targetPath)
 			return nil, status.Error(codes.Internal, err.Error())
 		}
 	} else {
@@ -717,14 +794,14 @@ func (ns *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 	}
 
 	if msgLog == "" {
-		log.Infof("NodeUnstageVolume: Unmount TargetPath successful, target %v, volumeId: %s", targetPath, req.VolumeId)
+		log.Log.Infof("NodeUnstageVolume: Unmount TargetPath successful, target %v, volumeId: %s", targetPath, req.VolumeId)
 	} else {
-		log.Infof(msgLog)
+		log.Log.Infof(msgLog)
 	}
 
 	if IsVFNode() {
 		if err := unbindBdfDisk(req.VolumeId); err != nil {
-			log.Errorf("NodeUnstageVolume: unbind bdf disk %s with error: %v", req.VolumeId, err)
+			log.Log.Errorf("NodeUnstageVolume: unbind bdf disk %s with error: %v", req.VolumeId, err)
 			return nil, err
 		}
 	}
@@ -733,7 +810,7 @@ func (ns *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 	if !GlobalConfigVar.ADControllerEnable {
 		// if DetachDisabled is set to true, return
 		if GlobalConfigVar.DetachDisabled {
-			log.Infof("NodeUnstageVolume: ADController is Disable, Detach Flag Set to false, PV %s", req.VolumeId)
+			log.Log.Infof("NodeUnstageVolume: ADController is Disable, Detach Flag Set to false, PV %s", req.VolumeId)
 			return &csi.NodeUnstageVolumeResponse{}, nil
 		}
 		ecsClient, err := getEcsClientByID(req.VolumeId, "")
@@ -742,7 +819,7 @@ func (ns *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 		}
 		err = detachDisk(ecsClient, req.VolumeId, ns.nodeID)
 		if err != nil {
-			log.Errorf("NodeUnstageVolume: VolumeId: %s, Detach failed with error %v", req.VolumeId, err.Error())
+			log.Log.Errorf("NodeUnstageVolume: VolumeId: %s, Detach failed with error %v", req.VolumeId, err.Error())
 			return nil, err
 		}
 		removeVolumeConfig(req.VolumeId)
@@ -766,7 +843,7 @@ func (ns *nodeServer) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoReque
 
 func (ns *nodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (
 	*csi.NodeExpandVolumeResponse, error) {
-	log.Infof("NodeExpandVolume: node expand volume: %v", req)
+	log.Log.Infof("NodeExpandVolume: node expand volume: %v", req)
 
 	volExpandBytes := int64(req.GetCapacityRange().GetRequiredBytes())
 	requestGB := float64((volExpandBytes + 1024*1024*1024 - 1) / (1024 * 1024 * 1024))
@@ -780,36 +857,59 @@ func (ns *nodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 	volumePath := req.GetVolumePath()
 	diskID := req.GetVolumeId()
 	if strings.Contains(volumePath, BLOCKVOLUMEPREFIX) {
-		log.Infof("NodeExpandVolume:: Block Volume not Expand FS, volumeId: %s, volumePath: %s", diskID, volumePath)
+		log.Log.Infof("NodeExpandVolume:: Block Volume not Expand FS, volumeId: %s, volumePath: %s", diskID, volumePath)
 		return &csi.NodeExpandVolumeResponse{}, nil
+	}
+
+	_, pvc, err := getPvPvcFromDiskId(diskID)
+	if err != nil {
+		log.Log.Errorf("NodeExpandVolume:: failed to get pvc from apiserver: %s", err.Error())
+	}
+
+	volumeExpandAutoSnapshotID := ""
+	if pvc != nil && pvc.Annotations != nil {
+		volumeExpandAutoSnapshotID, _ = pvc.Annotations[veasp.IDKey]
 	}
 
 	// volume resize in rund type will transfer to guest os
 	isRund, err := checkRundVolumeExpand(req)
 	if isRund && err == nil {
-		log.Infof("NodeExpandVolume:: Rund Volume ExpandFS Successful, volumeId: %s, volumePath: %s", diskID, volumePath)
+		log.Log.Infof("NodeExpandVolume:: Rund Volume ExpandFS Successful, volumeId: %s, volumePath: %s", diskID, volumePath)
 		return &csi.NodeExpandVolumeResponse{}, nil
 	} else if isRund && err != nil {
-		log.Errorf("NodeExpandVolume:: Rund Volume ExpandFS error(%s), volumeId: %s, volumePath: %s", err.Error(), diskID, volumePath)
+		log.Log.Errorf("NodeExpandVolume:: Rund Volume ExpandFS error(%s), volumeId: %s, volumePath: %s", err.Error(), diskID, volumePath)
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	devicePath := GetVolumeDeviceName(diskID)
-	if devicePath == "" {
-		log.Errorf("NodeExpandVolume:: can't get devicePath: %s", diskID)
+	snapshotEnable := volumeExpandAutoSnapshotID != ""
+	defer func() {
+		if snapshotEnable {
+			deleteUntagAutoSnapshot(volumeExpandAutoSnapshotID, diskID)
+		}
+	}()
+	devicePaths := GetVolumeDeviceName(diskID)
+	if len(devicePaths) == 0 {
+		log.Log.Errorf("NodeExpandVolume:: can't get devicePath: %s", diskID)
 		return nil, status.Error(codes.InvalidArgument, "can't get devicePath for "+diskID)
 	}
-	log.Infof("NodeExpandVolume:: volumeId: %s, devicePath: %s, volumePath: %s", diskID, devicePath, volumePath)
+	rootDevice, subDevice, err := GetRootSubDevicePath(devicePaths)
+	if err != nil {
+		log.Log.Errorf("NodeExpandVolume:: can't get devicePath: %s", diskID)
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	devicePath := ChooseDevice(rootDevice, subDevice)
+
+	log.Log.Infof("NodeExpandVolume:: volumeId: %s, devicePath: %s, volumePath: %s", diskID, devicePaths, volumePath)
 	beforeResizeDiskCapacity, err := getDiskCapacity(volumePath)
 	if err != nil {
-		log.Errorf("NodeExpandVolume:: get diskCapacity error %+v", err)
+		log.Log.Errorf("NodeExpandVolume:: get diskCapacity error %+v", err)
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
-	if GlobalConfigVar.DiskPartitionEnable && isDevicePartition(devicePath) {
+	if GlobalConfigVar.DiskPartitionEnable && !IsDeviceNvme(devicePath) && isDevicePartition(devicePath) {
 		rootPath, index, err := getDeviceRootAndIndex(devicePath)
 		if err != nil {
-			log.Errorf("NodeExpandVolume:: GetDeviceRootAndIndex: %s with error: %s", diskID, err.Error())
+			log.Log.Errorf("NodeExpandVolume:: GetDeviceRootAndIndex: %s with error: %s", diskID, err.Error())
 			return nil, status.Errorf(codes.InvalidArgument, "Volume %s GetDeviceRootAndIndex with error %s ", diskID, err.Error())
 		}
 		cmd := fmt.Sprintf("growpart %s %d", rootPath, index)
@@ -818,14 +918,14 @@ func (ns *nodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 				if strings.Contains(err.Error(), "it cannot be grown") || strings.Contains(err.Error(), "could only be grown by") {
 					deviceCapacity := getBlockDeviceCapacity(devicePath)
 					rootCapacity := getBlockDeviceCapacity(rootPath)
-					log.Infof("NodeExpandVolume: Volume %s with Device Partition %s no need to grown, with requestSize: %v, rootBlockSize: %v, partition BlockDevice size: %v", diskID, devicePath, requestGB, rootCapacity, deviceCapacity)
+					log.Log.Infof("NodeExpandVolume: Volume %s with Device Partition %s no need to grown, with requestSize: %v, rootBlockSize: %v, partition BlockDevice size: %v", diskID, devicePath, requestGB, rootCapacity, deviceCapacity)
 					return &csi.NodeExpandVolumeResponse{}, nil
 				}
 			}
-			log.Errorf("NodeExpandVolume: expand volume %s partition command: %s with error: %s", diskID, cmd, err.Error())
+			log.Log.Errorf("NodeExpandVolume: expand volume %s partition command: %s with error: %s", diskID, cmd, err.Error())
 			return nil, status.Errorf(codes.InvalidArgument, "NodeExpandVolume: expand volume %s partition with error: %s ", diskID, err.Error())
 		}
-		log.Infof("NodeExpandVolume: Successful expand partition for volume: %s device: %s partition: %d", diskID, rootPath, index)
+		log.Log.Infof("NodeExpandVolume: Successful expand partition for volume: %s device: %s partition: %d", diskID, rootPath, index)
 	}
 
 	// use resizer to expand volume filesystem
@@ -833,24 +933,33 @@ func (ns *nodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 	r := k8smount.NewResizeFs(mounter.Exec)
 	ok, err := r.Resize(devicePath, volumePath)
 	if err != nil {
-		log.Errorf("NodeExpandVolume:: Resize Error, volumeId: %s, devicePath: %s, volumePath: %s, err: %s", diskID, devicePath, volumePath, err.Error())
+		log.Log.Errorf("NodeExpandVolume:: Resize Error, volumeId: %s, devicePath: %s, volumePath: %s, err: %s", diskID, devicePath, volumePath, err.Error())
+		if snapshotEnable {
+			log.Log.Warnf("NodeExpandVolume:: Please use the snapshot %s for data recovery。 The retentionDays is %d", volumeExpandAutoSnapshotID, veasp.RetentionDays)
+			snapshotEnable = false
+		}
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	if !ok {
-		log.Errorf("NodeExpandVolume:: Resize failed, volumeId: %s, devicePath: %s, volumePath: %s", diskID, devicePath, volumePath)
+		log.Log.Errorf("NodeExpandVolume:: Resize failed, volumeId: %s, devicePath: %s, volumePath: %s", diskID, devicePath, volumePath)
+		if snapshotEnable {
+			log.Log.Warnf("NodeExpandVolume:: Please use the snapshot %s for data recovery。 The retentionDays is %d", volumeExpandAutoSnapshotID, veasp.RetentionDays)
+			snapshotEnable = false
+		}
 		return nil, status.Error(codes.Internal, "Fail to resize volume fs")
 	}
 	diskCapacity, err := getDiskCapacity(volumePath)
 	if err != nil {
-		log.Errorf("NodeExpandVolume:: get diskCapacity error %+v", err)
+		log.Log.Errorf("NodeExpandVolume:: get diskCapacity error %+v", err)
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	deviceCapacity := getBlockDeviceCapacity(devicePath)
-	log.Infof(
+	log.Log.Infof(
 		"NodeExpandVolume:: filesystem resize context device capacity: %v, before resize fs capacity: %v resize fs capacity: %v, requestGB: %v. file system lose percent: %v",
 		deviceCapacity, beforeResizeDiskCapacity, diskCapacity, requestGB, GlobalConfigVar.FilesystemLosePercent)
 	if diskCapacity >= requestGB*GlobalConfigVar.FilesystemLosePercent {
-		log.Infof("NodeExpandVolume:: resizefs successful volumeId: %s, devicePath: %s, volumePath: %s", diskID, devicePath, volumePath)
+		// delete autoSnapshot
+		log.Log.Infof("NodeExpandVolume:: resizefs successful volumeId: %s, devicePath: %s, volumePath: %s", diskID, devicePath, volumePath)
 		return &csi.NodeExpandVolumeResponse{}, nil
 	}
 	return nil, status.Error(codes.Internal, fmt.Sprintf("requestGB: %v, diskCapacity: %v not in range", requestGB, diskCapacity))
@@ -874,13 +983,13 @@ func (ns *nodeServer) unmountStageTarget(targetPath string) error {
 	if IsFileExisting(targetPath) {
 		notmounted, err := ns.k8smounter.IsLikelyNotMountPoint(targetPath)
 		if err != nil {
-			log.Errorf("unmountStageTarget: check mountPoint: %s mountpoint error: %v", targetPath, err)
+			log.Log.Errorf("unmountStageTarget: check mountPoint: %s mountpoint error: %v", targetPath, err)
 			return status.Error(codes.Internal, err.Error())
 		}
 		if !notmounted {
 			err = ns.k8smounter.Unmount(targetPath)
 			if err != nil {
-				log.Errorf("unmountStageTarget: umount path: %s failed with: %v", targetPath, err)
+				log.Log.Errorf("unmountStageTarget: umount path: %s failed with: %v", targetPath, err)
 				return status.Error(codes.Internal, err.Error())
 			}
 		} else {
@@ -890,7 +999,7 @@ func (ns *nodeServer) unmountStageTarget(targetPath string) error {
 		msgLog = fmt.Sprintf("unmountStageTarget: Path %s doesn't exist", targetPath)
 	}
 
-	log.Infof(msgLog)
+	log.Log.Infof(msgLog)
 	return nil
 }
 
@@ -915,62 +1024,89 @@ func (ns *nodeServer) mountDeviceToGlobal(capability *csi.VolumeCapability, volu
 	// do format-mount or mount
 	diskMounter := &k8smount.SafeFormatAndMount{Interface: ns.k8smounter, Exec: utilexec.New()}
 	if len(mkfsOptions) > 0 && (fsType == "ext4" || fsType == "ext3") {
-		if err := formatAndMount(diskMounter, device, sourcePath, fsType, mkfsOptions, mountOptions); err != nil {
-			log.Errorf("mountDeviceToGlobal: FormatAndMount fail with mkfsOptions %s, %s, %s, %s, %s with error: %s", device, sourcePath, fsType, mkfsOptions, mountOptions, err.Error())
+		if err := utils.FormatAndMount(diskMounter, device, sourcePath, fsType, mkfsOptions, mountOptions); err != nil {
+			log.Log.Errorf("mountDeviceToGlobal: FormatAndMount fail with mkfsOptions %s, %s, %s, %s, %s with error: %s", device, sourcePath, fsType, mkfsOptions, mountOptions, err.Error())
 			return status.Error(codes.Internal, err.Error())
 		}
 	} else {
 		if err := diskMounter.FormatAndMount(device, sourcePath, fsType, mountOptions); err != nil {
-			log.Errorf("mountDeviceToGlobal: Device: %s, FormatAndMount error: %s", device, err.Error())
+			log.Log.Errorf("mountDeviceToGlobal: Device: %s, FormatAndMount error: %s", device, err.Error())
 			return status.Error(codes.Internal, err.Error())
 		}
 	}
 	return nil
 }
 
-func (ns *nodeServer) unmountDuplicateMountPoint(targetPath string) error {
+func (ns *nodeServer) unmountDuplicateMountPoint(targetPath, volumeId string) error {
+	log.Log.Infof("unmountDuplicateMountPoint: start to unmount remains data: %s", targetPath)
 	pathParts := strings.Split(targetPath, "/")
 	partsLen := len(pathParts)
 	if partsLen > 2 && pathParts[partsLen-1] == "mount" {
 		globalPath2 := filepath.Join("/var/lib/container/kubelet/plugins/kubernetes.io/csi/pv/", pathParts[partsLen-2], "/globalmount")
-		if utils.IsFileExisting(globalPath2) {
-			// check globalPath2 is mountpoint
-			notmounted, err := ns.k8smounter.IsLikelyNotMountPoint(globalPath2)
-			if err == nil && !notmounted {
-				// check device is used by others
-				refs, err := ns.k8smounter.GetMountRefs(globalPath2)
-				if err == nil && !ns.mounter.HasMountRefs(globalPath2, refs) {
-					log.Infof("NodeUnpublishVolume: VolumeId Unmount global path %s for ack with kubelet data disk", globalPath2)
-					if err := utils.Umount(globalPath2); err != nil {
-						log.Errorf("NodeUnpublishVolume: volumeId: unmount global path %s failed with err: %v", globalPath2, err)
-						return status.Error(codes.Internal, err.Error())
-					}
-				} else {
-					log.Infof("Global Path %s is mounted by others: %v", globalPath2, refs)
-				}
-			} else {
-				log.Warnf("Global Path is not mounted: %s", globalPath2)
-			}
+
+		result := sha256.Sum256([]byte(fmt.Sprintf("%s", volumeId)))
+		volSha := fmt.Sprintf("%x", result)
+		globalPath3 := filepath.Join("/var/lib/container/kubelet/plugins/kubernetes.io/csi/", driverName, volSha, "/globalmount")
+		var err error
+		oldExists := utils.IsFileExisting(globalPath2)
+		if oldExists {
+			err = ns.unmountDuplicationPath(globalPath2)
 		}
+		newExists := utils.IsFileExisting(globalPath3)
+		if newExists {
+			err = ns.unmountDuplicationPath(globalPath3)
+		}
+		if oldExists && newExists {
+			log.Log.Info("unmountDuplicateMountPoint: oldPath & newPath exists at same time")
+			globalPath4 := filepath.Join("/var/lib/kubelet/plugins/kubernetes.io/csi/pv/", pathParts[partsLen-2], "/globalmount")
+			exists := utils.IsFileExisting(globalPath4)
+			if exists {
+				err = ns.forceUnmountPath(globalPath4)
+			}
+			err = ns.unmountDuplicationPath(globalPath3)
+		}
+		return err
 	} else {
-		log.Warnf("Target Path is illegal format: %s", targetPath)
+		log.Log.Warnf("Target Path is illegal format: %s", targetPath)
 	}
 	return nil
 }
 
-func (ns *nodeServer) getPvcFromDiskId(diskId string) (*v1.PersistentVolumeClaim, error) {
-	ctx := context.Background()
-	pv, err := ns.clientSet.CoreV1().PersistentVolumes().Get(ctx, diskId, metav1.GetOptions{})
-	if err != nil {
-		log.Errorf("getPvcFromDiskId: failed to get pv from apiserver: %v", err)
-		return nil, err
+func (ns *nodeServer) unmountDuplicationPath(globalPath string) error {
+	// check globalPath2 is mountpoint
+	notmounted, err := ns.k8smounter.IsLikelyNotMountPoint(globalPath)
+	if err != nil || notmounted {
+		log.Log.Warnf("Global Path is not mounted: %s", globalPath)
+		return nil
 	}
-	pvcName, pvcNamespace := pv.Spec.ClaimRef.Name, pv.Spec.ClaimRef.Namespace
-	pvc, err := ns.clientSet.CoreV1().PersistentVolumeClaims(pvcNamespace).Get(ctx, pvcName, metav1.GetOptions{})
-	if err != nil {
-		log.Errorf("getPvcFromDiskId: failed to get pvc from apiserver: %v", err)
+	// check device is used by others
+	refs, err := ns.k8smounter.GetMountRefs(globalPath)
+	if err == nil && !ns.mounter.HasMountRefs(globalPath, refs) {
+		log.Log.Infof("NodeUnpublishVolume: VolumeId Unmount global path %s for ack with kubelet data disk", globalPath)
+		if err := utils.Umount(globalPath); err != nil {
+			log.Log.Errorf("NodeUnpublishVolume: volumeId: unmount global path %s failed with err: %v", globalPath, err)
+			return status.Error(codes.Internal, err.Error())
+		}
+	} else {
+		log.Log.Infof("Global Path %s is mounted by others: %v", globalPath, refs)
 	}
-	return pvc, nil
+	return nil
+}
+
+func (ns *nodeServer) forceUnmountPath(globalPath string) error {
+	// check globalPath2 is mountpoint
+	notmounted, err := ns.k8smounter.IsLikelyNotMountPoint(globalPath)
+	if err != nil || notmounted {
+		log.Log.Warnf("Global Path is not mounted: %s", globalPath)
+		return nil
+	}
+	if err := utils.Umount(globalPath); err != nil {
+		log.Log.Errorf("NodeUnpublishVolume: volumeId: unmount global path %s failed with err: %v", globalPath, err)
+		return status.Error(codes.Internal, err.Error())
+	} else {
+		log.Log.Infof("forceUmountPath: umount Global Path %s  successful", globalPath)
+	}
+	return nil
 }
 
 // collectMountOptions returns array of mount options
@@ -988,4 +1124,79 @@ func collectMountOptions(fsType string, mntFlags []string) (options []string) {
 	}
 	return
 
+}
+
+// func  handle error : event( autoSnapshot ID return) + error
+func deleteVolumeExpandAutoSnapshot(ctx context.Context, volumeExpandAutoSnapshotID string) error {
+	log.Log.Infof("NodeExpandVolume:: Starting to delete volumeExpandAutoSnapshot with id: %s", volumeExpandAutoSnapshotID)
+
+	GlobalConfigVar.EcsClient = updateEcsClient(GlobalConfigVar.EcsClient)
+
+	response, err := requestAndDeleteSnapshot(volumeExpandAutoSnapshotID, veasp.ForceDelete)
+	if err != nil {
+		if response != nil {
+			log.Log.Errorf("NodeExpandVolume:: fail to delete %s with error: %s", volumeExpandAutoSnapshotID, err.Error())
+		}
+		return err
+	}
+	str := fmt.Sprintf("NodeExpandVolume:: Successfully delete snapshot %s", volumeExpandAutoSnapshotID)
+	log.Log.Info(str)
+	//utils.CreateEvent(cs.recorder, ref, v1.EventTypeNormal, snapshotDeletedSuccessfully, str)
+	return nil
+}
+
+// deleteUntagAutoSnapshot deletes and untags volumeExpandAutoSnapshot facing expand error
+func deleteUntagAutoSnapshot(snapshotID, diskID string) {
+	log.Log.Infof("Deleted volumeExpandAutoSnapshot with id: %s", snapshotID)
+	_, pvc, err := getPvPvcFromDiskId(diskID)
+	if err != nil {
+		log.Log.Errorf("NodeExpandVolume:: failed to get pvc from apiserver: %s", err.Error())
+	}
+	err = deleteVolumeExpandAutoSnapshot(context.Background(), snapshotID)
+	if err != nil {
+		log.Log.Errorf("NodeExpandVolume:: failed to delete volumeExpandAutoSnapshot: %s", err.Error())
+	}
+	err = updateVolumeExpandAutoSnapshotID(pvc, snapshotID, "delete")
+	if err != nil {
+		log.Log.Errorf("NodeExpandVolume:: failed to untag volumeExpandAutoSnapshot: %s", err.Error())
+	}
+}
+
+// checkStagingPathMounted ...
+func (ns *nodeServer) checkStagingPathMounted(volumeId, path, passedPath string) (bool, error) {
+
+	notMounted, err := ns.k8smounter.IsLikelyNotMountPoint(path)
+	log.Log.Infof("checkStagingPathMounted: check path: %s, passedPath: %s, mounted: %v", path, passedPath, !notMounted)
+	if err != nil && strings.Contains(err.Error(), "no such file or directory") && path != passedPath {
+		return false, nil
+	}
+	if err != nil {
+		log.Log.Errorf("NodeStageVolume: check volume %s path %s error: %v", volumeId, path, err)
+		return true, status.Error(codes.Internal, err.Error())
+	}
+	if !notMounted {
+		// if target path is mounted tmpfs, return
+		if utils.IsDirTmpfs(path) {
+			log.Log.Infof("NodeStageVolume: TargetPath(%s) is mounted as tmpfs, not need mount again", path)
+			return true, nil
+		}
+
+		// check device available
+		deviceName := GetDeviceByMntPoint(path)
+		if err := checkDeviceAvailable(deviceName, volumeId, path); err != nil {
+			if path != passedPath {
+				log.Log.Infof("checkStagingPathMounted: old version globalmount path: %s exists with empty dev: %v umount it", path, err)
+				err = ns.unmountStageTarget(path)
+				if err != nil {
+					return true, status.Error(codes.Internal, err.Error())
+				}
+				return false, nil
+			}
+			log.Log.Errorf("NodeStageVolume: mountPath is mounted %s, but check device available error: %s", path, err.Error())
+			return true, status.Error(codes.Internal, err.Error())
+		}
+		log.Log.Infof("NodeStageVolume:  volumeId: %s, Path: %s is already mounted, device: %s", volumeId, path, deviceName)
+		return true, nil
+	}
+	return false, nil
 }

@@ -19,6 +19,8 @@ package cpfs
 import (
 	"errors"
 	"fmt"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -43,15 +45,10 @@ type controllerServer struct {
 
 // resourcemode is selected by: subpath/filesystem
 const (
-	MNTROOTPATH = "/csi-persistentvolumes"
-	MBSIZE      = 1024 * 1024
-	DRIVER      = "driver"
+	MntRootPath = "/mnt"
 	SERVER      = "server"
-	MODE        = "mode"
 	VOLUMEAS    = "volumeAs"
-	PATH        = "path"
 	SUBPATH     = "subpath"
-	FILESYSTEM  = "filesystem"
 )
 
 // used by check pvc is processed
@@ -76,9 +73,26 @@ func NewControllerServer(d *csicommon.CSIDriver) csi.ControllerServer {
 	return c
 }
 
+func validateCreateVolumeRequest(req *csi.CreateVolumeRequest) error {
+	volName := req.GetName()
+	if len(volName) == 0 {
+		return status.Error(codes.InvalidArgument, "Volume name not provided")
+	}
+
+	log.Infof("Starting cpfs validate create volume request: %s, %v", req.Name, req)
+	valid, err := utils.CheckRequestArgs(req.GetParameters())
+	if !valid {
+		return status.Errorf(codes.InvalidArgument, err.Error())
+	}
+
+	return nil
+}
+
 // provisioner: create/delete cpfs volume
 func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
-	log.Infof("CreateVolume: Starting to Create CPFS volume: %v", req)
+	if err := validateCreateVolumeRequest(req); err != nil {
+		return nil, err
+	}
 
 	// step1: check pvc is created or not.
 	pvcUID := string(req.Name)
@@ -129,7 +143,7 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	log.Infof("Create Volume: %s, with Exist cpfs Server: %s, cpfs filesystem: %s, Path: %s, Options: %s", req.Name, cpfsServer, cpfsFileSystem, cpfsPath, cpfsOptions)
 
 	// local mountpoint for one volume
-	mountPoint := filepath.Join(MNTROOTPATH, pvName)
+	mountPoint := filepath.Join(MntRootPath, pvName)
 	if !utils.IsFileExisting(mountPoint) {
 		if err := os.MkdirAll(mountPoint, 0777); err != nil {
 			log.Errorf("CreateVolume: %s, Unable to create directory: %s, with error: %s", req.Name, mountPoint, err.Error())
@@ -189,6 +203,7 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 	if err != nil {
 		return nil, fmt.Errorf("DeleteVolume: Get Volume: %s from cluster error: %s", req.VolumeId, err.Error())
 	}
+
 	cpfsOptions = strings.Join(pvInfo.Spec.MountOptions, ",")
 	if pvInfo.Spec.CSI == nil {
 		return nil, fmt.Errorf("DeleteVolume: Volume Spec with CSI empty: %s, pv: %v", req.VolumeId, pvInfo)
@@ -238,7 +253,7 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 	}
 
 	// set the local mountpoint
-	mountPoint := filepath.Join(MNTROOTPATH, req.VolumeId+"-delete")
+	mountPoint := filepath.Join(MntRootPath, req.VolumeId+"-delete")
 	if err := DoMount(cpfsServer, cpfsFileSystem, cpfsPath, cpfsOptions, mountPoint, req.VolumeId); err != nil {
 		log.Errorf("DeleteVolume: %s, Mount server: %s, cpfsPath: %s, cpfsVersion: %s, cpfsOptions: %s, mountPoint: %s, with error: %s", req.VolumeId, cpfsServer, cpfsPath, cpfsFileSystem, cpfsOptions, mountPoint, err.Error())
 		return nil, fmt.Errorf("DeleteVolume: %s, Mount server: %s, cpfsPath: %s, cpfsVersion: %s, cpfsOptions: %s, mountPoint: %s, with error: %s", req.VolumeId, cpfsServer, cpfsPath, cpfsFileSystem, cpfsOptions, mountPoint, err.Error())

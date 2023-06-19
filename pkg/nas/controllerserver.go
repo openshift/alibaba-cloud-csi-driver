@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+    http:// www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -34,7 +34,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
+	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
 	"os"
 	"path/filepath"
@@ -45,9 +45,7 @@ import (
 
 // resourcemode is selected by: subpath/filesystem
 const (
-	MNTROOTPATH                = "/csi-persistentvolumes"
-	MBSize                     = 1024 * 1024
-	DRIVER                     = "driver"
+	MntRootPath                = "/mnt"
 	SERVER                     = "server"
 	ContainerNetworkFileSystem = "containerNetworkFileSystem"
 	MODE                       = "mode"
@@ -56,7 +54,6 @@ const (
 	PATH                       = "path"
 	ProtocolType               = "protocolType"
 	FileSystemType             = "fileSystemType"
-	Capacity                   = "capacity"
 	EncryptType                = "encryptType"
 	SnapshotID                 = "snapshotID"
 	StorageType                = "storageType"
@@ -80,12 +77,14 @@ const (
 	NASTAGVALUE2 = "alibabacloud-csi-plugin"
 	// NASTAGKEY3 key
 	NASTAGKEY3 = "ack.aliyun.com"
-	//AddDefaultTagsError means that the add nas default tags error
+	// AddDefaultTagsError means that the add nas default tags error
 	AddDefaultTagsError string = "AddDefaultTagsError"
 	// MntTypeKey tag
 	MntTypeKey = "mountType"
 	// LosetupType tag
 	LosetupType = "losetup"
+	// SkipMountType tag
+	SkipMountType = "skipmount"
 
 	allowVolumeExpansion = "allowVolumeExpansion"
 	csiAlibabaCloudName  = "csi.alibabacloud.com"
@@ -124,6 +123,7 @@ type nasVolumeArgs struct {
 	Mode            string           `json:"mode"`
 	ModeType        string           `json:"modeType"`
 	DeleteVolume    bool             `json:"deleteVolume"`
+	MountProtocol   string           `json:"mountProtocol"`
 }
 
 // used by check pvc is processed
@@ -133,19 +133,7 @@ var pvcFileSystemIDMap = map[string]string{}
 var pvcMountTargetMap = map[string]string{}
 
 // NewControllerServer is to create controller server
-func NewControllerServer(d *csicommon.CSIDriver, client *aliNas.Client, region, limit string) csi.ControllerServer {
-	config, err := rest.InClusterConfig()
-	if err != nil {
-		log.Fatalf("NewControllerServer: Failed to create config: %v", err)
-	}
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		log.Fatalf("NewControllerServer: Failed to create client: %v", err)
-	}
-	crdClient, err := dynamic.NewForConfig(config)
-	if err != nil {
-		log.Fatalf("NewControllerServer: Failed to create crd client: %v", err)
-	}
+func NewControllerServer(d *csicommon.CSIDriver, client *aliNas.Client, region, limit string, cfg *restclient.Config) csi.ControllerServer {
 	intLimit, err := strconv.Atoi(limit)
 	if err != nil {
 		log.Errorf("NewControllerServer: Failed to convert string limit to int: %s, err: %v", limit, err)
@@ -155,14 +143,28 @@ func NewControllerServer(d *csicommon.CSIDriver, client *aliNas.Client, region, 
 	log.Infof("NewControllerServer: current provisioner nas limit is %v", intLimit)
 	c := &controllerServer{
 		nasClient:               client,
-		crdClient:               crdClient,
+		crdClient:               GlobalConfigVar.DynamicClient,
 		region:                  region,
-		client:                  clientset,
+		client:                  GlobalConfigVar.KubeClient,
 		DefaultControllerServer: csicommon.NewDefaultControllerServer(d),
 		recorder:                utils.NewEventRecorder(),
 		rateLimiter:             ratelimit.New(intLimit),
 	}
 	return c
+}
+
+func validateCreateVolumeRequest(req *csi.CreateVolumeRequest) error {
+	volName := req.GetName()
+	if len(volName) == 0 {
+		return status.Error(codes.InvalidArgument, "Volume name not provided")
+	}
+
+	log.Infof("Starting nfs validate create volume request %s, %v", req.Name, req)
+	valid, err := utils.CheckRequestArgs(req.GetParameters())
+	if !valid {
+		return status.Errorf(codes.InvalidArgument, err.Error())
+	}
+	return nil
 }
 
 // provisioner: create/delete nas volume
@@ -173,8 +175,9 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		UID:       "",
 		Namespace: "",
 	}
-	log.Infof("CreateVolume: Starting NFS CreateVolume, %s, %v", req.Name, req)
-
+	if err := validateCreateVolumeRequest(req); err != nil {
+		return nil, err
+	}
 	// step1: check pvc is created or not.
 	if value, ok := pvcProcessSuccess[req.Name]; ok && value != nil {
 		log.Infof("CreateVolume: Nfs Volume %s has Created Already: %v", req.Name, value)
@@ -214,6 +217,9 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	volumeContext := map[string]string{}
 	csiTargetVol := &csi.Volume{}
 	if nasVol.VolumeAs == "filesystem" {
+		if len(nasVol.RegionID) == 0 {
+			nasVol.RegionID = GlobalConfigVar.Region
+		}
 		cs.nasClient = updateNasClient(cs.nasClient, nasVol.RegionID)
 		fileSystemID := ""
 		// if the pvc mapped fileSystem is already create, skip creating a filesystem
@@ -375,9 +381,9 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 			log.Errorf("CreateVolume: Input nfs server format error: volume: %s, server: %s", req.Name, nfsServerInputs)
 			return nil, fmt.Errorf("CreateVolume: Input nfs server format error: volume: %s, server: %s", req.Name, nfsServerInputs)
 		}
-		log.Infof("Create Volume: %s, with Exist Nfs Server: %s, Path: %s, Options: %s, Version: %s", req.Name, nfsServer, nfsPath, nfsOptions, nfsVersion)
+		log.Infof("Create Volume: %s, with Exist Nfs Server: %s, Path: %s, Options: %s, Version: %s, MountProtocol: %s", req.Name, nfsServer, nfsPath, nfsOptions, nfsVersion, nasVol.MountProtocol)
 
-		mountPoint := filepath.Join(MNTROOTPATH, pvName)
+		mountPoint := filepath.Join(MntRootPath, pvName)
 		if !utils.IsFileExisting(mountPoint) {
 			if err := os.MkdirAll(mountPoint, 0777); err != nil {
 				log.Errorf("CreateVolume: %s, Unable to create directory: %s, with error: %s", req.Name, mountPoint, err.Error())
@@ -394,17 +400,32 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 			}
 		}
 
-		if !GlobalConfigVar.NasFakeProvision || losetupType {
+		//use losetup device
+		if (!GlobalConfigVar.NasFakeProvision || losetupType) && nasVol.MountProtocol != MountProtocolCPFSNFS {
 			// local mountpoint for one volume
 			cs.rateLimiter.Take()
 			// step5: Mount nfs server to localpath
-			if !CheckNfsPathMounted(mountPoint, nfsServer, nfsPath) {
-				if err := DoNfsMount(nfsServer, nfsPath, nfsVersion, nfsOptionsStr, mountPoint, req.Name); err != nil {
+			if !CheckNfsPathMounted(mountPoint, nfsPath) {
+				//When subdirectories are mounted, determine whether to use eacClient
+				useEaClient := "false"
+				if len(nasVol.CnfsName) != 0 {
+					cnfs, err := v1beta1.GetCnfsObject(cs.crdClient, nasVol.CnfsName)
+					if err != nil {
+						return nil, err
+					}
+					useEaClient = cnfs.Status.FsAttributes.UseElasticAccelerationClient
+				}
+				//create subpath directory
+				if useEaClient == "true" || nasVol.MountProtocol == MountProtocolAliNas {
+					utils.CreateDestInHost(mountPoint)
+				}
+				//mount subpath directory
+				if err := DoMount(nasVol.MountProtocol, nfsServer, nfsPath, nfsVersion, nfsOptionsStr, mountPoint, req.Name, req.Name, useEaClient); err != nil {
 					log.Errorf("CreateVolume: %s, Mount server: %s, nfsPath: %s, nfsVersion: %s, nfsOptions: %s, mountPoint: %s, with error: %s", req.Name, nfsServer, nfsPath, nfsVersion, nfsOptionsStr, mountPoint, err.Error())
 					return nil, errors.New("CreateVolume: " + req.Name + ", Mount server: " + nfsServer + ", nfsPath: " + nfsPath + ", nfsVersion: " + nfsVersion + ", nfsOptions: " + nfsOptionsStr + ", mountPoint: " + mountPoint + ", with error: " + err.Error())
 				}
 			}
-			if !CheckNfsPathMounted(mountPoint, nfsServer, nfsPath) {
+			if !CheckNfsPathMounted(mountPoint, nfsPath) {
 				return nil, errors.New("Check Mount nfsserver not mounted " + nfsServer)
 			}
 
@@ -414,7 +435,7 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 				log.Errorf("Provision: %s, creating path: %s, with error: %s", req.Name, fullPath, err.Error())
 				return nil, errors.New("Provision: " + req.Name + ", creating path: " + fullPath + ", with error: " + err.Error())
 			}
-			os.Chmod(fullPath, 0777)
+			_ = os.Chmod(fullPath, 0777)
 
 			if losetupType {
 				if err = createLosetupPv(fullPath, volSizeBytes); err != nil {
@@ -451,6 +472,7 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 
 		volumeContext["volumeAs"] = nasVol.VolumeAs
 		volumeContext["path"] = filepath.Join(nfsPath, pvName)
+		volumeContext[MountProtocolTag] = nasVol.MountProtocol
 		if len(nasVol.CnfsName) != 0 {
 			volumeContext[ContainerNetworkFileSystem] = nasVol.CnfsName
 			delete(volumeContext, "server")
@@ -488,6 +510,7 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		}
 		volumeContext["volumeAs"] = nasVol.VolumeAs
 		volumeContext["path"] = nfsPath
+		volumeContext[MountProtocolTag] = nasVol.MountProtocol
 		if len(nasVol.CnfsName) != 0 {
 			volumeContext[ContainerNetworkFileSystem] = nasVol.CnfsName
 			delete(volumeContext, "server")
@@ -531,6 +554,7 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 	}
 
 	volumeAs, fileSystemID, deleteVolume, pvPath, nfsPath, nfsServer, nfsOptions := "", "", "", "", "", "", ""
+	useEaClient := "false"
 	nfsOptions = strings.Join(pvInfo.Spec.MountOptions, ",")
 	if pvInfo.Spec.CSI == nil {
 		return nil, fmt.Errorf("DeleteVolume: Volume Spec with CSI empty: %s, pv: %v", req.VolumeId, pvInfo)
@@ -555,6 +579,9 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 		}
 		nfsServer = cnfs.Status.FsAttributes.Server
 		fileSystemID = cnfs.Status.FsAttributes.FilesystemID
+		if cnfs.Status.FsAttributes.UseElasticAccelerationClient == "true" {
+			useEaClient = "true"
+		}
 	} else {
 		return nil, fmt.Errorf("DeleteVolume: Volume Spec with nfs server empty: %s, CSI: %v", req.VolumeId, pvInfo.Spec.CSI)
 	}
@@ -562,6 +589,10 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 		pvPath = value
 	} else {
 		return nil, fmt.Errorf("DeleteVolume: Volume Spec with nfs path empty: %s, CSI: %v", req.VolumeId, pvInfo.Spec.CSI)
+	}
+	mountProtocol := MountProtocolNFS
+	if value, ok := pvInfo.Spec.CSI.VolumeAttributes[MountProtocolTag]; ok {
+		mountProtocol = value
 	}
 
 	if pvInfo.Spec.StorageClassName == "" {
@@ -575,6 +606,8 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 	regionID := ""
 	if value, ok := storageclass.Parameters[RegionID]; ok {
 		regionID = value
+	} else {
+		regionID = GlobalConfigVar.Region
 	}
 	cs.nasClient = updateNasClient(cs.nasClient, regionID)
 	if volumeAs == "filesystem" {
@@ -655,12 +688,13 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 		}
 
 		// set the local mountpoint
-		mountPoint := filepath.Join(MNTROOTPATH, req.VolumeId+"-delete")
-		if err := DoNfsMount(nfsServer, nfsPath, nfsVersion, nfsOptions, mountPoint, req.VolumeId); err != nil {
+		mountPoint := filepath.Join(MntRootPath, req.VolumeId+"-delete")
+		// create subpath-delete directory
+		if err := DoMount(mountProtocol, nfsServer, nfsPath, nfsVersion, nfsOptions, mountPoint, req.VolumeId, req.VolumeId, useEaClient); err != nil {
 			log.Errorf("DeleteVolume: %s, Mount server: %s, nfsPath: %s, nfsVersion: %s, nfsOptions: %s, mountPoint: %s, with error: %s", req.VolumeId, nfsServer, nfsPath, nfsVersion, nfsOptions, mountPoint, err.Error())
 			return nil, fmt.Errorf("DeleteVolume: %s, Mount server: %s, nfsPath: %s, nfsVersion: %s, nfsOptions: %s, mountPoint: %s, with error: %s", req.VolumeId, nfsServer, nfsPath, nfsVersion, nfsOptions, mountPoint, err.Error())
 		}
-		if !CheckNfsPathMounted(mountPoint, nfsServer, nfsPath) {
+		if !CheckNfsPathMounted(mountPoint, nfsPath) {
 			return nil, errors.New("Check Mount nfsserver fail " + nfsServer + " error with: ")
 		}
 		defer utils.Umount(mountPoint)
@@ -690,7 +724,7 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 				if strings.Contains(nfsServer, ".nas.aliyuncs.com") &&
 					!strings.Contains(nfsServer, ".extreme.nas.aliyuncs.com") &&
 					!strings.Contains(nfsServer, ".cpfs.nas.aliyuncs.com") {
-					fileSystemID = GetFsIDByServer(nfsServer)
+					fileSystemID = GetFsIDByNasServer(nfsServer)
 					if len(fileSystemID) != 0 {
 						//1、Does describe dir quota exist?
 						//2、If the dir quota exists, cancel the quota before deleting the subdirectory.
@@ -905,7 +939,10 @@ func (cs *controllerServer) getNasVolumeOptions(req *csi.CreateVolumeRequest) (*
 		if nasVolArgs.Mode, ok = volOptions[MODE]; !ok {
 			nasVolArgs.Mode = ""
 		}
-
+		// Protocol
+		if nasVolArgs.MountProtocol, ok = volOptions[MountProtocolTag]; !ok {
+			nasVolArgs.MountProtocol = MountProtocolNFS
+		}
 		// modeType
 		if nasVolArgs.ModeType, ok = volOptions[ModeType]; !ok {
 			nasVolArgs.ModeType = "non-recursive"
@@ -917,6 +954,7 @@ func (cs *controllerServer) getNasVolumeOptions(req *csi.CreateVolumeRequest) (*
 }
 
 func (cs *controllerServer) ValidateVolumeCapabilities(ctx context.Context, req *csi.ValidateVolumeCapabilitiesRequest) (*csi.ValidateVolumeCapabilitiesResponse, error) {
+
 	for _, cap := range req.VolumeCapabilities {
 		if cap.GetAccessMode().GetMode() != csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER {
 			return &csi.ValidateVolumeCapabilitiesResponse{Message: ""}, nil

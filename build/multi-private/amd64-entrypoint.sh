@@ -7,7 +7,6 @@ mkdir -p /var/log/alicloud/
 mkdir -p /host/etc/kubernetes/volumes/disk/uuid
 
 HOST_CMD="/nsenter --mount=/proc/1/ns/mnt"
-zone_id=`${HOST_CMD} curl http://100.100.100.200/latest/meta-data/zone-id`
 
 
 host_os="centos"
@@ -20,8 +19,17 @@ if [[ "$os_release_exist" = "0" ]]; then
     if [[ `echo ${osID} | grep "alinux" | wc -l` != "0" ]] && [[ "${osVersion}" ]]; then
         host_os="alinux3"
     fi
+    if [[ `echo ${osID} | grep "kylin" | wc -l` != "0" ]]; then
+        host_os="kylin"
+    fi
+    if [[ `echo ${osID} | grep "uos" | wc -l` != "0" ]] ; then
+        host_os="uos"
+    fi
 		if [[ `echo ${osID} | grep "lifsea" | wc -l` != "0" ]]; then
         host_os="lifsea"
+    fi
+    if [[ `echo ${osID} | grep "anolis" | wc -l` != "0" ]]; then
+        host_os="anolis"
     fi
 fi
 
@@ -70,15 +78,18 @@ done
 
 ## OSS plugin setup
 if [ "$run_oss" = "true" ]; then
-
     ossfsVer="1.80.6.ack.1"
     if [ "$USE_UPDATE_OSSFS" == "" ]; then
-        ossfsVer="1.86.4"
+        ossfsVer="1.88.0"
     fi
 
     ossfsArch="centos7.0"
     if [[ ${host_os} == "alinux3" ]]; then
         ${HOST_CMD} yum install -y libcurl-devel libxml2-devel fuse-devel openssl-devel
+        ossfsArch="centos8"
+    fi
+    if [[ ${host_os} == "kylin" ]] || [[ ${host_os} == "uos" ]] || [[ ${host_os} == "anolis" ]]; then
+        ossfsVer="1.88.0"
         ossfsArch="centos8"
     fi
 
@@ -97,7 +108,6 @@ if [ "$run_oss" = "true" ]; then
     if [ ! `/nsenter --mount=/proc/1/ns/mnt which ossfs` ]; then
         echo "First install ossfs, ossfsVersion: $ossfsVer"
         cp /root/ossfs_${ossfsVer}_${ossfsArch}_x86_64.rpm /host/etc/csi-tool/
-        # /nsenter --mount=/proc/1/ns/mnt yum localinstall -y /etc/csi-tool/ossfs_${ossfsVer}_${ossfsArch}_x86_64.rpm
 				reconcileOssFS="install"
     # update OSSFS
     else
@@ -107,7 +117,6 @@ if [ "$run_oss" = "true" ]; then
             echo "Upgrade ossfs, ossfsVersion: $ossfsVer"
             /nsenter --mount=/proc/1/ns/mnt yum remove -y ossfs
             cp /root/ossfs_${ossfsVer}_${ossfsArch}_x86_64.rpm /host/etc/csi-tool/
-            # /nsenter --mount=/proc/1/ns/mnt yum localinstall -y /etc/csi-tool/ossfs_${ossfsVer}_${ossfsArch}_x86_64.rpm
 						reconcileOssFS="upgrade"
         fi
     fi
@@ -118,7 +127,7 @@ if [ "$run_oss" = "true" ]; then
           cp ./usr/local/bin/ossfs /host/etc/csi-tool/
           /nsenter --mount=/proc/1/ns/mnt cp /etc/csi-tool/ossfs /usr/local/bin/ossfs
       else
-          /nsenter --mount=/proc/1/ns/mnt yum localinstall -y /etc/csi-tool/ossfs_${ossfsVer}_${ossfsArch}_x86_64.rpm
+          /nsenter --mount=/proc/1/ns/mnt rpm -ivh --nodeps /etc/csi-tool/ossfs_${ossfsVer}_${ossfsArch}_x86_64.rpm
       fi
     fi
 
@@ -130,7 +139,7 @@ if [ "$run_oss" = "true" ]; then
           /nsenter --mount=/proc/1/ns/mnt cp /etc/csi-tool/ossfs /usr/local/bin/ossfs
       else
           /nsenter --mount=/proc/1/ns/mnt yum remove -y ossfs
-          /nsenter --mount=/proc/1/ns/mnt yum localinstall -y /etc/csi-tool/ossfs_${ossfsVer}_${ossfsArch}_x86_64.rpm
+          /nsenter --mount=/proc/1/ns/mnt rpm -ivh --nodeps /etc/csi-tool/ossfs_${ossfsVer}_${ossfsArch}_x86_64.rpm
       fi
     fi
 
@@ -151,7 +160,7 @@ if [ "$run_oss" = "true" ]; then
 
 fi
 
-if [ "$run_oss" = "true" ] || ["$run_disk" = "true"]; then
+if [ "$run_oss" = "true" ] || ["$run_disk" = "true" ]; then
     ## install/update csi connector
     updateConnector="true"
 		systemdDir="/host/usr/lib/systemd/system"
