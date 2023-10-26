@@ -1,0 +1,18 @@
+FROM registry.ci.openshift.org/ocp/builder:rhel-8-golang-1.20-openshift-4.15 AS builder
+WORKDIR /go/src/github.com/kubernetes-sigs/alibaba-cloud-csi-driver
+COPY . .
+# Build the disk CSI driver binary. Do not build docker image.
+RUN build/build-all-amd.sh noimage
+
+FROM registry.ci.openshift.org/ocp/4.15:base
+# Get mkfs & blkid & pciutils
+RUN yum update -y && \
+    yum install --setopt=tsflags=nodocs -y e2fsprogs xfsprogs util-linux ca-certificates file tzdata nfs-utils pciutils && \
+    yum clean all && rm -rf /var/cache/yum/*
+
+COPY --from=builder /go/src/github.com/kubernetes-sigs/alibaba-cloud-csi-driver/plugin.csi.alibabacloud.com  /usr/bin/
+
+# Upstream CSI driver image has its on /nsenter binary, let's use the distro one
+RUN ln -s /usr/bin/nsenter /nsenter
+
+ENTRYPOINT ["/usr/bin/plugin.csi.alibabacloud.com"]
