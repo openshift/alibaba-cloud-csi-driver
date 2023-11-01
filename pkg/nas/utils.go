@@ -24,7 +24,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -60,6 +59,8 @@ const (
 	Resize2fsFailedFilename = "resize2fs_failed.txt"
 	// Resize2fsFailedFixCmd ...
 	Resize2fsFailedFixCmd = "%s fsck -a %s"
+
+	GiB = 1 << 30
 )
 
 var (
@@ -82,26 +83,40 @@ type RoleAuth struct {
 }
 
 // DoMount execute the mount command for nas dir
-func DoMount(nfsProtocol, nfsServer, nfsPath, nfsVers, mountOptions, mountPoint, volumeID, podUID, useEaClient string) error {
+func DoMount(fsType, clientType, nfsProtocol, nfsServer, nfsPath, nfsVers, mountOptions, mountPoint, volumeID, podUID string) error {
 	if !utils.IsFileExisting(mountPoint) {
 		_ = CreateDest(mountPoint)
 	}
 
 	if CheckNfsPathMounted(mountPoint, nfsPath) {
-		log.Infof("DoMount: nfs server is already mounted: %s, %s", nfsServer, nfsPath)
+		log.Infof("DoMount: server is already mounted: %s, %s", nfsServer, nfsPath)
 		return nil
 	}
 
 	var mntCmd string
 	var err error
-	//EAC Mount
-	if len(useEaClient) != 0 && useEaClient == "true" {
-		if nfsProtocol == MountProtocolCPFSEAC {
-			mntCmd = fmt.Sprintf("systemd-run --scope -- mount -t alinas -o eac -o protocol=nfs3 -o bindtag=%s -o client_owner=%s -o %s %s:%s %s", volumeID, podUID, mountOptions, nfsServer, nfsPath, mountPoint)
-		} else {
-			mntCmd = fmt.Sprintf("systemd-run --scope -- mount -t alinas -o eac -o bindtag=%s -o client_owner=%s -o %s %s:%s %s", volumeID, podUID, mountOptions, nfsServer, nfsPath, mountPoint)
+	//CNFS-EFC Mount
+	switch clientType {
+	case EFCClient:
+		switch fsType {
+		case "standard":
+			mntCmd = fmt.Sprintf("systemd-run --scope -- mount -t alinas -o efc -o bindtag=%s -o client_owner=%s -o %s %s:%s %s", volumeID, podUID, mountOptions, nfsServer, nfsPath, mountPoint)
+		case "cpfs":
+			mntCmd = fmt.Sprintf("systemd-run --scope -- mount -t alinas -o efc -o protocol=nfs3 -o bindtag=%s -o client_owner=%s -o %s %s:%s %s", volumeID, podUID, mountOptions, nfsServer, nfsPath, mountPoint)
+		default:
+			return errors.New("EFC Client don't support this storage type:" + fsType)
 		}
-	} else {
+		err = utils.DoMountInHost(mntCmd)
+	case NativeClient:
+		switch fsType {
+		case "cpfs":
+			mntCmd = fmt.Sprintf("systemd-run --scope -- mount -t cpfs -o %s %s:%s %s", mountOptions, nfsServer, nfsPath, mountPoint)
+			mntCmd = NsenterCmd + " " + mntCmd
+		default:
+			return errors.New("Native Client don't support this storage type:" + fsType)
+		}
+		_, err = utils.ValidateRun(mntCmd)
+	default:
 		//NFS Mount(Capacdity/Performance Extreme Nas、Cpfs2.0, AliNas)
 		versStr := fmt.Sprintf("vers=%s", nfsVers)
 		if mountOptions == "" {
@@ -109,6 +124,7 @@ func DoMount(nfsProtocol, nfsServer, nfsPath, nfsVers, mountOptions, mountPoint,
 		} else if !strings.Contains(mountOptions, versStr) {
 			mountOptions = versStr + "," + mountOptions
 		}
+		//nfsProtocol: cpfs-nfs/nfs/alinas
 		mntCmd = fmt.Sprintf("mount -t %s -o %s %s:%s %s", nfsProtocol, mountOptions, nfsServer, nfsPath, mountPoint)
 		if nfsProtocol == MountProtocolCPFSNFS || nfsProtocol == MountProtocolAliNas {
 			mntCmd = NsenterCmd + " " + mntCmd
@@ -136,11 +152,6 @@ func DoMount(nfsProtocol, nfsServer, nfsPath, nfsVers, mountOptions, mountPoint,
 				return err
 			}
 		}
-	}
-	//execute mount
-	if len(useEaClient) != 0 && useEaClient == "true" {
-		err = utils.DoMountInHost(mntCmd)
-	} else {
 		_, err = utils.ValidateRun(mntCmd)
 	}
 	if err != nil {
@@ -244,21 +255,14 @@ func updateNasClient(client *aliNas.Client, regionID string) *aliNas.Client {
 }
 
 func newNasClient(ac utils.AccessControl, regionID string) (nasClient *aliNas.Client) {
-	var err error
-	switch ac.UseMode {
-	case utils.AccessKey:
-		nasClient, err = aliNas.NewClientWithAccessKey(regionID, ac.AccessKeyID, ac.AccessKeySecret)
-	case utils.Credential:
-		nasClient, err = aliNas.NewClientWithOptions(regionID, ac.Config, ac.Credential)
-	default:
-		nasClient, err = aliNas.NewClientWithStsToken(regionID, ac.AccessKeyID, ac.AccessKeySecret, ac.StsToken)
+	nasClient, err := aliNas.NewClientWithOptions(regionID, ac.Config, ac.Credential)
+	if err != nil {
+		return nil
 	}
+
 	if os.Getenv("ALICLOUD_CLIENT_SCHEME") != "HTTP" {
 		nasClient.SetHTTPSInsecure(false)
 		nasClient.GetConfig().WithScheme("HTTPS")
-	}
-	if err != nil {
-		return nil
 	}
 
 	// Set Nas Endpoint
@@ -370,7 +374,6 @@ func setNasVolumeCapacity(nfsServer, nfsPath string, volSizeBytes int64) error {
 	if nfsPath == "" || nfsPath == "/" {
 		return fmt.Errorf("Volume %s:%s not support set quota to root path ", nfsServer, nfsPath)
 	}
-	pvSizeGB := volSizeBytes / (1024 * 1024 * 1024)
 	nasClient := updateNasClient(GlobalConfigVar.NasClient, GlobalConfigVar.Region)
 	fsList := strings.Split(nfsServer, "-")
 	if len(fsList) < 1 {
@@ -381,8 +384,7 @@ func setNasVolumeCapacity(nfsServer, nfsPath string, volSizeBytes int64) error {
 	quotaRequest.Path = nfsPath
 	quotaRequest.UserType = "AllUsers"
 	quotaRequest.QuotaType = "Enforcement"
-	pvSizeGBStr := strconv.FormatInt(pvSizeGB, 10)
-	quotaRequest.SizeLimit = requests.Integer(pvSizeGBStr)
+	quotaRequest.SizeLimit = requests.NewInteger64((volSizeBytes + GiB - 1) / GiB)
 	quotaRequest.RegionId = GetMetaData(RegionTag)
 	_, err := nasClient.SetDirQuota(quotaRequest)
 	if err != nil {
@@ -543,7 +545,7 @@ func mountLosetupPv(mountPoint string, opt *Options, volumeID string) error {
 		return fmt.Errorf("mountLosetupPv: create nfs mountPath error %s ", err.Error())
 	}
 	//mount nas to use losetup dev
-	err := DoMount(opt.MountProtocol, opt.Server, opt.Path, opt.Vers, opt.Options, nfsPath, volumeID, podID, "false")
+	err := DoMount("nas", "nfsclient", opt.MountProtocol, opt.Server, opt.Path, opt.Vers, opt.Options, nfsPath, volumeID, podID)
 	if err != nil {
 		return fmt.Errorf("mountLosetupPv: mount losetup volume failed: %s", err.Error())
 	}
@@ -657,13 +659,13 @@ func getPvObj(volumeID string) (*v1.PersistentVolume, error) {
 
 func isValidCnfsParameter(server string, cnfsName string) error {
 	if len(server) == 0 && len(cnfsName) == 0 {
-		msg := fmt.Sprintf("Server and Cnfs need to be configured at least one.")
+		msg := "Server and Cnfs need to be configured at least one."
 		log.Errorf(msg)
 		return errors.New(msg)
 	}
 
 	if len(server) != 0 && len(cnfsName) != 0 {
-		msg := fmt.Sprintf("Server and Cnfs can only be configured to use one.")
+		msg := "Server and Cnfs can only be configured to use one."
 		log.Errorf(msg)
 		return errors.New(msg)
 	}

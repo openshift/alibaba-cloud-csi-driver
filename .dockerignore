@@ -1,0 +1,5 @@
+# OpenShift carry: Copy .git to the container, build/build-all-amd.sh does `git rev-parse --short`
+#.git
+.github
+*.md
+OWNERS

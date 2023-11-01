@@ -20,9 +20,11 @@ os_release_exist=$?
 #get host os type
 if [[ "$os_release_exist" = "0" ]]; then
     osID=`${HOST_CMD} cat /etc/os-release | grep "ID=" | grep -v "VERSION_ID"`
-    osVersion=`${HOST_CMD} cat /etc/os-release | grep "VERSION_ID=" | grep "^VERSION_ID=\"3"`
-    if [[ `echo ${osID} | grep "alinux" | wc -l` != "0" ]] && [[ "${osVersion}" ]]; then
-        host_os="alinux3"
+    if [[ `echo ${osID} | grep "alinux" | wc -l` != "0" ]]; then
+        osVersion=`${HOST_CMD} cat /etc/os-release | grep "VERSION_ID=" | grep "^VERSION_ID=\"3"`
+        if [[ "${osVersion}" ]]; then
+            host_os="alinux3"
+        fi
     fi
     if [[ `echo ${osID} | grep "kylin" | wc -l` != "0" ]]; then
         host_os="kylin"
@@ -34,13 +36,16 @@ if [[ "$os_release_exist" = "0" ]]; then
         host_os="lifsea"
     fi
     if [[ `echo ${osID} | grep "anolis" | wc -l` != "0" ]]; then
-        host_os="anolis"
+        osVersion=`${HOST_CMD} cat /etc/os-release | grep "VERSION_ID=" | grep "^VERSION_ID=\"8"`
+        if [[ "${osVersion}" ]]; then
+            host_os="anolis8"
+        fi
     fi
 fi
 
 #update oss file in kylin/uos
 ossPath=/usr/bin/ossfs
-if [[ ${host_os} == "kylin" ]] || [[ ${host_os} == "uos" ]] || [[ ${host_os} == "anolis" ]] || [[ ${host_os} == "alinux3" ]]; then
+if [[ ${host_os} == "kylin" ]] || [[ ${host_os} == "uos" ]] || [[ ${host_os} == "anolis8" ]] || [[ ${host_os} == "alinux3" ]]; then
    ossPath=/usr/bin/ossfs-8u
 fi
 
@@ -164,6 +169,7 @@ if [ "$run_disk" = "true" ] || [ "$run_oss" = "true" ]; then
 					rm -rf /host/etc/csi-tool/
 					rm -rf /host/etc/csi-tool/connector.sock
 					rm -rf /var/log/alicloud/connector.pid
+					rm -rf /var/run/csiplugin/connector.pid
 					mkdir -p /host/etc/csi-tool/
 			fi
 		fi
@@ -201,6 +207,7 @@ if [ "$run_disk" = "true" ] || [ "$run_oss" = "true" ]; then
     fi
 
     rm -rf /var/log/alicloud/connector.pid
+    rm -rf /var/run/csiplugin/connector.pid
     /nsenter --mount=/proc/1/ns/mnt systemctl enable csiplugin-connector.service
     /nsenter --mount=/proc/1/ns/mnt systemctl restart csiplugin-connector.service
 

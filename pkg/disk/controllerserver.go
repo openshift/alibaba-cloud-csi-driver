@@ -75,6 +75,8 @@ type diskVolumeArgs struct {
 	DelAutoSnap             string              `json:"delAutoSnap"`
 	ARN                     []ecs.CreateDiskArn `json:"arn"`
 	VolumeSizeAutoAvailable bool                `json:"volumeSizeAutoAvailable"`
+	ProvisionedIops         int                 `json:"provisionedIops"`
+	BurstingEnabled         bool                `json:"burstingEnabled"`
 }
 
 // Alicloud disk snapshot parameters
@@ -605,7 +607,7 @@ func (cs *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateS
 		return nil, err
 	case snapNum > 1:
 		log.Log.Errorf("CreateSnapshot:: Find Snapshot name[%s], but get more than 1 instance", req.Name)
-		err := status.Error(codes.Internal, fmt.Sprintf("CreateSnapshot: get snapshot more than 1 instance"))
+		err := status.Error(codes.Internal, "CreateSnapshot: get snapshot more than 1 instance")
 		utils.CreateEvent(cs.recorder, ref, v1.EventTypeWarning, snapshotTooMany, err.Error())
 		return nil, err
 	case err != nil:
@@ -1101,6 +1103,11 @@ func (cs *controllerServer) autoSnapshot(ctx context.Context, disk *ecs.Disk) (b
 	pv, pvc, err := getPvPvcFromDiskId(disk.DiskId)
 	if err != nil {
 		log.Log.Errorf("ControllerExpandVolume:: failed to get pvc from apiserver: %s", err.Error())
+		return true, nil, nil
+	}
+
+	if pv.Spec.CSI == nil || pv.Spec.CSI.VolumeAttributes == nil {
+		log.Log.Errorf("ControllerExpandVolume: pv.Spec.CSI/Spec.CSI.VolumeAttributes is nil, volumeId=%s", disk.DiskId)
 		return true, nil, nil
 	}
 

@@ -13,8 +13,10 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/aliyun/alibaba-cloud-sdk-go/services/ecs"
+	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/utils"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 )
@@ -42,6 +44,8 @@ const (
 	DiskBdfTagKey = "bdf.csi.aliyun.com"
 	// DiskBdfCheckTagKey disk bdf check tag
 	DiskBdfCheckTagKey = "check.bdf.csi.aliyun.com"
+	// Vfhp Reconcile period
+	VfhpReconcilePeriod = 600
 )
 
 // PatchStringValue type
@@ -294,34 +298,60 @@ func storeBdfInfo(diskID, bdf string) (err error) {
 		log.Warnf("storeBdfInfo: AddTags error: %s, %s", diskID, err.Error())
 		return
 	}
-	log.Infof("Storing bdf information successfully")
+	log.Info("Storing bdf information successfully")
 	return nil
 }
 
 func clearBdfInfo(diskID, bdf string) (err error) {
-	info := BdfAttachInfo{
-		Depend:             bdf != "",
-		LastAttachedNodeID: GlobalConfigVar.NodeID,
-	}
-	infoBytes, _ := json.Marshal(info)
 
-	removeTagsRequest := ecs.CreateRemoveTagsRequest()
-	tmpTag := ecs.RemoveTagsTag{Key: DiskBdfTagKey, Value: string(infoBytes)}
-	removeTagsRequest.Tag = &[]ecs.RemoveTagsTag{tmpTag}
-	removeTagsRequest.ResourceType = "disk"
-	removeTagsRequest.ResourceId = diskID
-	removeTagsRequest.RegionId = GlobalConfigVar.Region
+	log.Infof("clearBdfInfo: bdf: %s", bdf)
 	ecsClient, err := getEcsClientByID(diskID, "")
 	if err != nil {
 		return err
 	}
+
+	bdfInfoString := ""
+	if bdf == "" {
+		diskInfo := getDisk(diskID, ecsClient)
+		if len(diskInfo) != 1 {
+			log.Warnf("clearBdfInfo: cannot get disk: %s", diskID)
+			return err
+		}
+		bdfTagExist := false
+		for _, tag := range diskInfo[0].Tags.Tag {
+			if tag.TagKey == DiskBdfTagKey {
+				bdfInfoString = tag.Value
+				bdfTagExist = true
+				break
+			}
+		}
+		if !bdfTagExist {
+			return nil
+		}
+	}
+
+	if bdfInfoString == "" {
+		info := BdfAttachInfo{
+			Depend:             bdf != "",
+			LastAttachedNodeID: GlobalConfigVar.NodeID,
+		}
+		infoBytes, _ := json.Marshal(info)
+		bdfInfoString = string(infoBytes)
+	}
+
+	removeTagsRequest := ecs.CreateRemoveTagsRequest()
+	tmpTag := ecs.RemoveTagsTag{Key: DiskBdfTagKey, Value: bdfInfoString}
+	removeTagsRequest.Tag = &[]ecs.RemoveTagsTag{tmpTag}
+	removeTagsRequest.ResourceType = "disk"
+	removeTagsRequest.ResourceId = diskID
+	removeTagsRequest.RegionId = GlobalConfigVar.Region
 	_, err = ecsClient.RemoveTags(removeTagsRequest)
 	if err != nil {
 		log.Warnf("storeBdfInfo: Remove error: %s, %s", diskID, err.Error())
 		return err
 	}
 
-	log.Infof("Deleting bdf information successfully")
+	log.Infof("Deleting bdf information successfully for Disk: %s", diskID)
 	return nil
 }
 
@@ -373,42 +403,84 @@ func forceDetachAllowed(ecsClient *ecs.Client, disk *ecs.Disk, nodeID string) (a
 }
 
 var vfOnce = new(sync.Once)
+
+// isVF means ecsClient running in VF mode
+// the instance is VF Node and iohub-vfhp-helper notworking
 var isVF = false
+
+// is VFInstance means instance is VF Node;
+var isVFInstance = false
 
 // IsVFNode returns whether the current node is vf
 func IsVFNode() bool {
 	vfOnce.Do(func() {
-		output, err := ExecCheckOutput("lspci", "-D")
-		if err != nil {
-			log.Fatalf("[IsVFNode] lspci -D: %v", err)
-		}
-		// 0000:4b:00.0 SCSI storage controller: Device 1ded:1001
-		matched := FindLines(output, "storage controller")
-		if len(matched) == 0 {
-			log.Errorf("[IsVFNode] not found storage controller")
-			return
-		}
-		for _, line := range matched {
-			// 1ded: is alibaba cloud
-			if !strings.Contains(line, "1ded:") {
-				continue
-			}
-			bdf := strings.SplitN(line, " ", 2)[0]
-			if !strings.HasSuffix(bdf, ".0") {
-				continue
-			}
-			output, err = ExecCheckOutput("lspci", "-s", bdf, "-v")
+		is_bdf := os.Getenv("IS_BDF")
+		if is_bdf == "true" {
+			isVF = true
+			isVFInstance = true
+		} else {
+			output, err := ExecCheckOutput("lspci", "-D")
 			if err != nil {
-				log.Errorf("[IsVFNode] lspic -s %s -v: %v", bdf, err)
+				log.Fatalf("[IsVFNode] lspci -D: %v", err)
+			}
+			// 0000:4b:00.0 SCSI storage controller: Device 1ded:1001
+			matched := FindLines(output, "storage controller")
+			if len(matched) == 0 {
+				log.Errorf("[IsVFNode] not found storage controller")
 				return
 			}
-			// Capabilities: [110] Single Root I/O Virtualization (SR-IOV)
-			matched = FindLines(output, "Single Root I/O Virtualization")
-			if len(matched) > 0 {
-				isVF = true
-				break
+			for _, line := range matched {
+				// 1ded: is alibaba cloud
+				if !strings.Contains(line, "1ded:") && !strings.Contains(line, "Alibaba") {
+					continue
+				}
+				bdf := strings.SplitN(line, " ", 2)[0]
+				if !strings.HasSuffix(bdf, ".0") {
+					continue
+				}
+				output, err = ExecCheckOutput("lspci", "-s", bdf, "-v")
+				if err != nil {
+					log.Errorf("[IsVFNode] lspic -s %s -v: %v", bdf, err)
+					return
+				}
+				// Capabilities: [110] Single Root I/O Virtualization (SR-IOV)
+				matched = FindLines(output, "Single Root I/O Virtualization")
+				if len(matched) > 0 {
+					isVF = true
+					isVFInstance = true
+					log.Infof("[IsVFNode] change isVF to true isVF: %v", isVF)
+					break
+				}
 			}
 		}
+		log.Infof("[IsVFNode] isVF: %v", isVF)
+		checkVfhpOnline()
 	})
 	return isVF
+}
+
+func checkVfhpOnlineReconcile() {
+	for {
+		vfRecord := isVF
+		checkVfhpOnline()
+		if vfRecord != isVF {
+			log.Infof("checkVfhpOnlineReconcile: Node iohub-vfhp-helper is changed, isVF flag from %t to %t", vfRecord, isVF)
+		}
+		time.Sleep(time.Duration(VfhpReconcilePeriod) * time.Second)
+	}
+}
+
+func checkVfhpOnline() {
+	cmd := fmt.Sprintf("%s iohub-vfhp-helper -s", NsenterCmd)
+	_, err := utils.Run(cmd)
+	if err == nil {
+		isVF = false
+		return
+	}
+	log.Infof("checkVfhpOnline: check node vfhp helper cmd exec err: %+v", err)
+}
+
+// IsVFInstance check node is vf or not
+func IsVFInstance() bool {
+	return isVFInstance
 }

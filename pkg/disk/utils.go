@@ -35,6 +35,7 @@ import (
 	"time"
 	"unicode"
 
+	"golang.org/x/sys/unix"
 	v1 "k8s.io/api/core/v1"
 
 	aliyunep "github.com/aliyun/alibaba-cloud-sdk-go/sdk/endpoints"
@@ -47,15 +48,13 @@ import (
 	volumeSnapshotV1 "github.com/kubernetes-csi/external-snapshotter/client/v4/apis/volumesnapshot/v1"
 	snapClientset "github.com/kubernetes-csi/external-snapshotter/client/v4/clientset/versioned"
 	proto "github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/disk/proto"
-	log "github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/log"
 	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/utils"
 	perrors "github.com/pkg/errors"
+	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/kubernetes/pkg/volume/util/fs"
 	k8smount "k8s.io/mount-utils"
 	utilexec "k8s.io/utils/exec"
 )
@@ -192,7 +191,7 @@ func GetMetaData(resource string) string {
 
 // GetDeviceByMntPoint return the device info from given mount point
 func GetDeviceByMntPoint(targetPath string) string {
-	deviceCmd := fmt.Sprintf("mount | grep \"on %s\"  | grep -v grep | awk 'NR==1 {print $1}'", targetPath)
+	deviceCmd := fmt.Sprintf("mount | grep \"on %s\" | awk 'NR==1 {print $1}'", targetPath)
 	deviceCmdOut, err := run(deviceCmd)
 	if err != nil {
 		return ""
@@ -202,13 +201,13 @@ func GetDeviceByMntPoint(targetPath string) string {
 
 // GetDeviceMountNum get the device mount number
 func GetDeviceMountNum(targetPath string) int {
-	deviceCmd := fmt.Sprintf("mount | grep %s  | grep -v grep | awk '{print $1}'", targetPath)
+	deviceCmd := fmt.Sprintf("mount | grep %s | awk '{print $1}'", targetPath)
 	deviceCmdOut, err := run(deviceCmd)
 	if err != nil {
 		return 0
 	}
 	deviceCmdOut = strings.TrimSuffix(deviceCmdOut, "\n")
-	deviceNumCmd := fmt.Sprintf("mount | grep \"%s \" | grep -v grep | wc -l", deviceCmdOut)
+	deviceNumCmd := fmt.Sprintf("mount | grep \"%s \" | wc -l", deviceCmdOut)
 	deviceNumOut, err := run(deviceNumCmd)
 	if err != nil {
 		return 0
@@ -293,7 +292,7 @@ func retryGetInstanceDoc() (*instanceDocument, error) {
 	for i := 0; i < utils.MetadataMaxRetrycount; i++ {
 		doc, err = getInstanceDoc()
 		if err != nil {
-			log.Log.Errorf("retryGetInstanceDoc: failed to get instance doc for %v try, err: %v", i, err)
+			log.Errorf("retryGetInstanceDoc: failed to get instance doc for %v try, err: %v", i, err)
 			continue
 		}
 		return doc, nil
@@ -334,7 +333,7 @@ func GetDeviceByBdf(bdf string, enLog bool) (device string, err error) {
 		}
 	}
 	if enLog {
-		log.Log.Infof("Device bdf: %s, virtio numbers: %v", bdf, virtioNumbers)
+		log.Infof("Device bdf: %s, virtio numbers: %v", bdf, virtioNumbers)
 	}
 	if len(virtioNumbers) == 0 {
 		return "", fmt.Errorf("virtio device not found, bdf: %s", bdf)
@@ -351,7 +350,7 @@ func GetDeviceByBdf(bdf string, enLog bool) (device string, err error) {
 		if filepath.Base(targetPath) == virtioNumbers[0] {
 			devicePath := fmt.Sprintf("/dev/%s", filepath.Base(filepath.Dir(device)))
 			if enLog {
-				log.Log.Infof("Device bdf: %s, device: %s", bdf, devicePath)
+				log.Infof("Device bdf: %s, device: %s", bdf, devicePath)
 			}
 			return devicePath, nil
 		}
@@ -362,14 +361,14 @@ func GetDeviceByBdf(bdf string, enLog bool) (device string, err error) {
 func getDeviceSerial(serial string) (device string) {
 	serialFiles, err := filepath.Glob("/sys/block/*/serial")
 	if err != nil {
-		log.Log.Infof("List device serial failed: %v", err)
+		log.Infof("List device serial failed: %v", err)
 		return ""
 	}
 
 	for _, serialFile := range serialFiles {
 		body, err := ioutil.ReadFile(serialFile)
 		if err != nil {
-			log.Log.Errorf("Read serial(%s): %v", serialFile, err)
+			log.Errorf("Read serial(%s): %v", serialFile, err)
 			continue
 		}
 		if strings.TrimSpace(string(body)) == serial {
@@ -503,6 +502,9 @@ func makeDevicePath(name string) string {
 func getDeviceRootAndIndex(devicePath string) (string, int, error) {
 	rootDevicePath := ""
 	index := -1
+	if IsDeviceNvme(devicePath) {
+		return devicePath, -1, nil
+	}
 	re := regexp.MustCompile(`\d+`)
 	regexpRes := re.FindAllStringSubmatch(devicePath, -1)
 	if len(regexpRes) == 0 {
@@ -559,7 +561,7 @@ func GetDiskFormat(disk string) (string, string, error) {
 				return "", "", nil
 			}
 		}
-		log.Log.Errorf("Could not determine if disk %q is formatted (%v)", disk, err)
+		log.Errorf("Could not determine if disk %q is formatted (%v)", disk, err)
 		return "", "", err
 	}
 
@@ -604,13 +606,13 @@ func getNvmeDeviceByVolumeID(volumeID string) (device string, err error) {
 			cmd := fmt.Sprintf("%s udevadm info --query=all --name=/dev/%s | grep ID_SERIAL_SHORT | awk -F= '{print $2}'", NsenterCmd, f.Name())
 			snumber, err := utils.Run(cmd)
 			if err != nil {
-				log.Log.Warnf("GetNvmeDeviceByVolumeID: Get device with command %s and got error: %s", cmd, err.Error())
+				log.Warnf("GetNvmeDeviceByVolumeID: Get device with command %s and got error: %s", cmd, err.Error())
 				continue
 			}
 			snumber = strings.TrimSpace(snumber)
 			if serialNumber == strings.TrimSpace(snumber) {
 				device = filepath.Join("/dev/", f.Name())
-				log.Log.Infof("GetNvmeDeviceByVolumeID: Get nvme device %s with volumeID %s", device, volumeID)
+				log.Infof("GetNvmeDeviceByVolumeID: Get nvme device %s with volumeID %s", device, volumeID)
 				return device, nil
 			}
 		}
@@ -627,10 +629,10 @@ func GetDeviceByVolumeID(volumeID string) (devices []string, err error) {
 		device := getDeviceSerial(strings.TrimPrefix(volumeID, "d-"))
 		if device != "" {
 			if devices, err = adaptDevicePartition(device); err != nil {
-				log.Log.Warnf("GetDevice: Get volume %s device %s by Serial, but validate error %s", volumeID, device, err.Error())
+				log.Warnf("GetDevice: Get volume %s device %s by Serial, but validate error %s", volumeID, device, err.Error())
 				return []string{}, fmt.Errorf("PartitionError: Get volume %s device %s by Serial, but validate error %s ", volumeID, device, err.Error())
 			}
-			log.Log.Infof("GetDevice: Use the serial to find device, got %s, volumeID: %s, devices: %v", device, volumeID, devices)
+			log.Infof("GetDevice: Use the serial to find device, got %s, volumeID: %s, devices: %v", device, volumeID, devices)
 			return devices, nil
 		}
 	}
@@ -662,7 +664,7 @@ func GetDeviceByVolumeID(volumeID string) (devices []string, err error) {
 				}
 			}
 			if !isSearched {
-				log.Log.Warnf("volumeID link path %q not found", volumeLinPath)
+				log.Warnf("volumeID link path %q not found", volumeLinPath)
 				return []string{}, fmt.Errorf("volumeID link path %q not found", volumeLinPath)
 			}
 		} else {
@@ -671,7 +673,7 @@ func GetDeviceByVolumeID(volumeID string) (devices []string, err error) {
 	}
 
 	if stat.Mode()&os.ModeSymlink != os.ModeSymlink {
-		log.Log.Warningf("volumeID link file %q found, but was not a symlink", volumeLinPath)
+		log.Warningf("volumeID link file %q found, but was not a symlink", volumeLinPath)
 		return []string{}, fmt.Errorf("volumeID link file %q found, but was not a symlink", volumeLinPath)
 	}
 	// Find the target, resolving to an absolute path
@@ -685,11 +687,11 @@ func GetDeviceByVolumeID(volumeID string) (devices []string, err error) {
 	}
 
 	if devices, err = adaptDevicePartition(resolved); err != nil {
-		log.Log.Warnf("GetDevice: Get volume %s device %s by ID, but validate error %s", volumeID, resolved, err.Error())
+		log.Warnf("GetDevice: Get volume %s device %s by ID, but validate error %s", volumeID, resolved, err.Error())
 		return []string{}, fmt.Errorf("PartitionError: Get volume %s device %s by Serial, but validate error %s ", volumeID, resolved, err.Error())
 	}
 
-	log.Log.Infof("GetDevice: Device Link Info: %s link to %s", volumeLinPath, devices)
+	log.Infof("GetDevice: Device Link Info: %s link to %s", volumeLinPath, devices)
 	return devices, nil
 }
 
@@ -718,7 +720,7 @@ func GetVolumeIDByDevice(device string) (volumeID string, err error) {
 		if stat.Mode()&os.ModeSymlink == os.ModeSymlink {
 			resolved, err := filepath.EvalSymlinks(filePath)
 			if err != nil {
-				log.Log.Errorf("GetVolumeIDByDevice: error reading target of symlink %q: %v", filePath, err)
+				log.Errorf("GetVolumeIDByDevice: error reading target of symlink %q: %v", filePath, err)
 				continue
 			}
 			if strings.HasSuffix(resolved, device) {
@@ -870,7 +872,7 @@ func getDiskVolumeOptions(req *csi.CreateVolumeRequest) (*diskVolumeArgs, error)
 			// topology aware feature to get zoneid
 			diskVolArgs.ZoneID = pickZone(req.GetAccessibilityRequirements())
 			if diskVolArgs.ZoneID == "" {
-				log.Log.Errorf("CreateVolume: Can't get topology info , please check your setup or set zone ID in storage class. Use zone from Meta service: %s", req.Name)
+				log.Errorf("CreateVolume: Can't get topology info , please check your setup or set zone ID in storage class. Use zone from Meta service: %s", req.Name)
 				diskVolArgs.ZoneID = GetMetaData(ZoneIDTag)
 			}
 		}
@@ -1021,6 +1023,25 @@ func getDiskVolumeOptions(req *csi.CreateVolumeRequest) (*diskVolumeArgs, error)
 		}
 	}
 
+	diskVolArgs.ProvisionedIops = -1
+	value, ok = volOptions[PROVISIONED_IOPS_KEY]
+	if ok {
+		iValue, err := strconv.Atoi(value)
+		if err != nil || iValue < 0 {
+			return nil, fmt.Errorf("getDiskVolumeOptions: parameters provisionedIops[%s] is illegal", value)
+		}
+		diskVolArgs.ProvisionedIops = iValue
+	}
+
+	diskVolArgs.BurstingEnabled = false
+	value, ok = volOptions[BURSTING_ENABLED_KEY]
+	if ok {
+		value = strings.ToLower(value)
+		if value == "yes" || value == "true" || value == "1" {
+			diskVolArgs.BurstingEnabled = true
+		}
+	}
+
 	return diskVolArgs, nil
 }
 
@@ -1057,7 +1078,7 @@ func validateDiskPerformaceLevel(opts map[string]string) (performaceLevel string
 	if !ok || pl == "" {
 		return "", nil
 	}
-	log.Log.Infof("validateDiskPerformaceLevel: pl: %v", pl)
+	log.Infof("validateDiskPerformaceLevel: pl: %v", pl)
 	if strings.Contains(pl, ",") {
 		for _, cusPer := range strings.Split(pl, ",") {
 			if _, ok := CustomDiskPerfermance[cusPer]; !ok {
@@ -1070,13 +1091,13 @@ func validateDiskPerformaceLevel(opts map[string]string) (performaceLevel string
 
 func checkDeviceAvailable(devicePath, volumeID, targetPath string) error {
 	if devicePath == "" {
-		msg := fmt.Sprintf("devicePath is empty, cannot used for Volume")
+		msg := "devicePath is empty, cannot used for Volume"
 		return status.Error(codes.Internal, msg)
 	}
 
 	// block volume
 	if devicePath == "devtmpfs" {
-		findmntCmd := fmt.Sprintf("findmnt %s | grep -v grep | awk '{if(NR>1)print $2}'", targetPath)
+		findmntCmd := fmt.Sprintf("findmnt %s | awk '{if(NR>1)print $2}'", targetPath)
 		output, err := utils.Run(findmntCmd)
 		if err != nil {
 			return status.Error(codes.Internal, err.Error())
@@ -1121,7 +1142,7 @@ func GetVolumeDeviceName(diskID string) []string {
 	if err != nil {
 		deviceName := getVolumeConfig(diskID)
 		devices = []string{deviceName}
-		log.Log.Infof("GetVolumeDeviceName, Get Device Name by Config File %s, DeviceName: %s", diskID, deviceName)
+		log.Infof("GetVolumeDeviceName, Get Device Name by Config File %s, DeviceName: %s", diskID, deviceName)
 	}
 	return devices
 }
@@ -1151,29 +1172,27 @@ func deleteEmpty(s []string) []string {
 }
 
 func getDiskCapacity(devicePath string) (float64, error) {
-	_, capacity, _, _, _, _, err := fs.FsInfo(devicePath)
+	statfs := &unix.Statfs_t{}
+	err := unix.Statfs(devicePath, statfs)
+
 	if err != nil {
-		log.Log.Errorf("getDiskCapacity:: get device error: %+v", err)
+		log.Errorf("getDiskCapacity:: get device error: %+v", err)
 		return 0, fmt.Errorf("getDiskCapacity:: get device error: %+v", err)
 	}
-	capacity, ok := (*(resource.NewQuantity(capacity, resource.BinarySI))).AsInt64()
-	if !ok {
-		log.Log.Errorf("getDiskCapacity:: failed to fetch capacity bytes for target: %s", devicePath)
-		return 0, status.Error(codes.Unknown, "failed to fetch capacity bytes")
-	}
-	return float64(capacity) / GBSIZE, nil
+
+	return float64(statfs.Blocks*uint64(statfs.Bsize)) / GBSIZE, nil
 }
 
 func getBlockDeviceCapacity(devicePath string) float64 {
 
 	file, err := os.Open(devicePath)
 	if err != nil {
-		log.Log.Errorf("getBlockDeviceCapacity:: failed to open devicePath: %v", devicePath)
+		log.Errorf("getBlockDeviceCapacity:: failed to open devicePath: %v", devicePath)
 		return 0
 	}
 	pos, err := file.Seek(0, io.SeekEnd)
 	if err != nil {
-		log.Log.Errorf("getBlockDeviceCapacity:: failed to read devicePath: %v", devicePath)
+		log.Errorf("getBlockDeviceCapacity:: failed to read devicePath: %v", devicePath)
 		return 0
 	}
 	return float64(pos) / GBSIZE
@@ -1186,7 +1205,7 @@ func UpdateNode(nodeID string, c *ecs.Client) {
 	nodeName := os.Getenv(kubeNodeName)
 	nodeInfo, err := GlobalConfigVar.ClientSet.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
 	if err != nil {
-		log.Log.Errorf("UpdateNode:: get node info error : %s", err.Error())
+		log.Errorf("UpdateNode:: get node info error : %s", err.Error())
 		return
 	}
 	instanceType := nodeInfo.Labels[instanceTypeLabel]
@@ -1203,12 +1222,12 @@ func UpdateNode(nodeID string, c *ecs.Client) {
 	waitErr := wait.PollImmediate(updatePollInterval, 30*time.Second, func() (bool, error) {
 		response, err = c.DescribeAvailableResource(request)
 		if err != nil {
-			log.Log.Errorf("UpdateNode:: describe available resource with nodeID: %s", instanceType)
+			log.Errorf("UpdateNode:: describe available resource with nodeID: %s", instanceType)
 			return false, err
 		}
 		return true, nil
 	})
-	log.Log.Infof("UpdateNode: record ecs openapi req: %+v, resp: %+v", request, response)
+	log.Infof("UpdateNode: record ecs openapi req: %+v, resp: %+v", request, response)
 	availableZones := response.AvailableZones.AvailableZone
 	if len(availableZones) == 1 {
 		availableZone := availableZones[0]
@@ -1221,15 +1240,15 @@ func UpdateNode(nodeID string, c *ecs.Client) {
 					instanceStorageLabels = append(instanceStorageLabels, labelKey)
 				}
 			} else {
-				log.Log.Errorf("UpdateNode:: multi available datadisk error: %v", availableResources)
+				log.Errorf("UpdateNode:: multi available datadisk error: %v", availableResources)
 				return
 			}
 		} else {
-			log.Log.Errorf("UpdateNode:: multi available resource error: %v", availableResources)
+			log.Errorf("UpdateNode:: multi available resource error: %v", availableResources)
 			return
 		}
 	} else {
-		log.Log.Errorf("UpdateNode:: multi available zones error: %v", availableZones)
+		log.Errorf("UpdateNode:: multi available zones error: %v", availableZones)
 		return
 	}
 	needUpdate := false
@@ -1262,12 +1281,12 @@ func UpdateNode(nodeID string, c *ecs.Client) {
 				return false, err
 			}
 		} else {
-			log.Log.Info("UpdateNode:: need not to update node label")
+			log.Info("UpdateNode:: need not to update node label")
 		}
 		return true, nil
 	})
 	if waitErr != nil {
-		log.Log.Errorf("UpdateNode:: failed to update node status: err: %v", lastUpdateError)
+		log.Errorf("UpdateNode:: failed to update node status: err: %v", lastUpdateError)
 	}
 }
 
@@ -1278,10 +1297,13 @@ func getMeta(node *v1.Node) (string, string, string) {
 		zoneID = value
 	}
 	if value := node.Labels[regionIDLabelNew]; value != "" {
-		log.Log.Infof("getZoneID:: fix regionid value by: %s", value)
+		log.Infof("getZoneID:: fix regionid value by: %s", value)
 		regionID = value
 	}
-	return regionID, zoneID, ""
+	providerID := node.Spec.ProviderID
+	nodeID := utils.ParseProviderID(providerID)
+
+	return regionID, zoneID, nodeID
 }
 
 // getZoneID ...
@@ -1289,7 +1311,7 @@ func getZoneID(c *ecs.Client, instanceID string) (string, string) {
 
 	node, err := GlobalConfigVar.ClientSet.CoreV1().Nodes().Get(context.Background(), instanceID, metav1.GetOptions{})
 	if err != nil {
-		log.Log.Fatalf("getZoneID:: get node error: %v", err)
+		log.Fatalf("getZoneID:: get node error: %v", err)
 	}
 	ecsKey := os.Getenv("NODE_LABEL_ECS_ID_KEY")
 	ecsID := ""
@@ -1313,10 +1335,10 @@ func getZoneID(c *ecs.Client, instanceID string) (string, string) {
 	}
 	instanceResponse, err := c.DescribeInstances(request)
 	if err != nil {
-		log.Log.Fatalf("getZoneID:: describe instance id error: %s ecsID: %s", err.Error(), ecsID)
+		log.Fatalf("getZoneID:: describe instance id error: %s ecsID: %s", err.Error(), ecsID)
 	}
 	if len(instanceResponse.Instances.Instance) != 1 {
-		log.Log.Fatalf("getZoneID:: describe instance returns error instance count: %v, ecsID: %v", len(instanceResponse.Instances.Instance), ecsID)
+		log.Fatalf("getZoneID:: describe instance returns error instance count: %v, ecsID: %v", len(instanceResponse.Instances.Instance), ecsID)
 	}
 	return instanceResponse.Instances.Instance[0].ZoneId, ecsID
 }
@@ -1371,8 +1393,8 @@ func getTenantUIDByVolumeID(volumeID string) (uid string, err error) {
 	if err != nil {
 		return "", perrors.Wrapf(err, "get pv, volumeId=%s", volumeID)
 	}
-	if pv.Spec.CSI == nil {
-		return "", perrors.Errorf("pv.Spec.CSI is nil, volumeId=%s", volumeID)
+	if pv.Spec.CSI == nil || pv.Spec.CSI.VolumeAttributes == nil {
+		return "", perrors.Errorf("pv.Spec.CSI/Spec.CSI.VolumeAttributes is nil, volumeId=%s", volumeID)
 	}
 	return pv.Spec.CSI.VolumeAttributes[TenantUserUID], nil
 }
@@ -1460,7 +1482,7 @@ func volumeCreate(diskType, diskID string, volSizeBytes int64, volumeContext map
 		volumeContext[annAppendPrefix+annVolumeTopoKey] = string(diskTypeTopoBytes)
 	}
 
-	log.Log.Infof("volumeCreate: volumeContext: %+v", volumeContext)
+	log.Infof("volumeCreate: volumeContext: %+v", volumeContext)
 	tmpVol := &csi.Volume{
 		CapacityBytes:      volSizeBytes,
 		VolumeId:           diskID,
@@ -1535,7 +1557,7 @@ func updateVolumeContext(volumeContext map[string]string) map[string]string {
 func getSnapshotInfoByID(snapshotID string) (string, string, *timestamp.Timestamp) {
 	content, err := GlobalConfigVar.SnapClient.SnapshotV1().VolumeSnapshotContents().Get(context.TODO(), snapshotID, metav1.GetOptions{})
 	if err != nil {
-		log.Log.Errorf("getSnapshotContentByID:: get snapshot content in cluster err: %v", err)
+		log.Errorf("getSnapshotContentByID:: get snapshot content in cluster err: %v", err)
 		return "", "", nil
 	}
 	if targetRegion, ok := content.Labels[RemoteSnapshotLabelKey]; ok {
@@ -1549,22 +1571,19 @@ func getSnapshotInfoByID(snapshotID string) (string, string, *timestamp.Timestam
 
 // getVolumeCount
 func getVolumeCount() int64 {
+	var availableVolumeCount int
+
 	ecsClient := updateEcsClient(GlobalConfigVar.EcsClient)
-	instanceType := ""
-	var err error
-	volumeCount := int64(MaxVolumesPerNode)
+	instanceType := utils.RetryGetMetaData("instance/instance-type")
+	diskList := utils.RetryGetMetaData("disks/")
+	log.Infof("getVolumeCount: instanceType: %s, diskList: %s", instanceType, diskList)
+	existsDiskCount := 2
+	if diskList != "" {
+		existsDiskCount = len(strings.Split(diskList, "\n"))
+		log.Infof("getVolumeCount: disk count was rewritten to %d", existsDiskCount)
+	}
 
 	for i := 0; i < 5; i++ {
-		// get instance type for node
-		if instanceType == "" {
-			instanceType, err = utils.GetMetaData("instance/instance-type")
-			if err != nil {
-				log.Log.Warnf("getVolumeCount: get instance type with error: %s", err.Error())
-				time.Sleep(time.Duration(1) * time.Second)
-				continue
-			}
-		}
-
 		// describe ecs instance type
 		req := ecs.CreateDescribeInstanceTypesRequest()
 		req.RegionId = GlobalConfigVar.Region
@@ -1572,7 +1591,7 @@ func getVolumeCount() int64 {
 		response, err := ecsClient.DescribeInstanceTypes(req)
 		// if auth failed, return with default
 		if err != nil && strings.Contains(err.Error(), "Forbidden") {
-			log.Log.Errorf("getVolumeCount: describe instance type with error: %s", err.Error())
+			log.Errorf("getVolumeCount: describe instance type with error: %s", err.Error())
 			return MaxVolumesPerNode
 			// not forbidden error, retry
 		} else if err != nil && !strings.Contains(err.Error(), "Forbidden") {
@@ -1580,14 +1599,14 @@ func getVolumeCount() int64 {
 			continue
 		}
 		if len(response.InstanceTypes.InstanceType) != 1 {
-			log.Log.Warnf("getVolumeCount: get instance max volume failed type with %v", response)
+			log.Warnf("getVolumeCount: get instance max volume failed type with %v", response)
 			return MaxVolumesPerNode
 		}
-		volumeCount = int64(response.InstanceTypes.InstanceType[0].DiskQuantity) - 2
-		log.Log.Infof("getVolumeCount: get instance max volume %d type with response %v", volumeCount, response)
+		availableVolumeCount = response.InstanceTypes.InstanceType[0].DiskQuantity - existsDiskCount
+		log.Infof("getVolumeCount: get instance max volume %d type with response %v", availableVolumeCount, response)
 		break
 	}
-	return volumeCount
+	return int64(availableVolumeCount)
 }
 
 // hasMountOption return boolean value indicating whether the slice contains a mount option
@@ -1614,7 +1633,7 @@ func checkRundVolumeExpand(req *csi.NodeExpandVolumeRequest) (bool, error) {
 	// connect to rund server with timeout
 	clientConn, err := net.DialTimeout("unix", socketFile, 1*time.Second)
 	if err != nil {
-		log.Log.Errorf("checkRundExpand: volume %s, volumepath %s, connect to rund server with error: %s", req.VolumeId, req.VolumePath, err.Error())
+		log.Errorf("checkRundExpand: volume %s, volumepath %s, connect to rund server with error: %s", req.VolumeId, req.VolumePath, err.Error())
 		return true, perrors.Errorf("checkRundExpand: volume %s, volumepath %s, connect to rund server with error: %s", req.VolumeId, req.VolumePath, err.Error())
 	}
 	defer clientConn.Close()
@@ -1626,11 +1645,11 @@ func checkRundVolumeExpand(req *csi.NodeExpandVolumeRequest) (bool, error) {
 		Volume: pvName,
 	})
 	if err != nil {
-		log.Log.Errorf("checkRundExpand: volume %s, volumepath %s, connect to rund server with error response: %s", req.VolumeId, req.VolumePath, err.Error())
+		log.Errorf("checkRundExpand: volume %s, volumepath %s, connect to rund server with error response: %s", req.VolumeId, req.VolumePath, err.Error())
 		return true, perrors.Errorf("checkRundExpand: volume %s, volumepath %s, connect to rund server with error response: %s", req.VolumeId, req.VolumePath, err.Error())
 	}
 
-	log.Log.Infof("RundVolumeExpand: Expand VolumeFS(%s) to(%s) successful with response: %s", pvName, volumeSize, resp)
+	log.Infof("RundVolumeExpand: Expand VolumeFS(%s) to(%s) successful with response: %s", pvName, volumeSize, resp)
 	return true, nil
 }
 
@@ -1666,13 +1685,13 @@ func getPvPvcFromDiskId(diskId string) (*v1.PersistentVolume, *v1.PersistentVolu
 	ctx := context.Background()
 	pv, err := GlobalConfigVar.ClientSet.CoreV1().PersistentVolumes().Get(ctx, diskId, metav1.GetOptions{})
 	if err != nil {
-		log.Log.Errorf("getPvcFromDiskId: failed to get pv from apiserver: %v", err)
+		log.Errorf("getPvcFromDiskId: failed to get pv from apiserver: %v", err)
 		return nil, nil, err
 	}
 	pvcName, pvcNamespace := pv.Spec.ClaimRef.Name, pv.Spec.ClaimRef.Namespace
 	pvc, err := GlobalConfigVar.ClientSet.CoreV1().PersistentVolumeClaims(pvcNamespace).Get(ctx, pvcName, metav1.GetOptions{})
 	if err != nil {
-		log.Log.Errorf("getPvcFromDiskId: failed to get pvc from apiserver: %v", err)
+		log.Errorf("getPvcFromDiskId: failed to get pvc from apiserver: %v", err)
 		return nil, nil, err
 	}
 	return pv, pvc, nil

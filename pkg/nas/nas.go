@@ -25,7 +25,7 @@ import (
 
 	aliNas "github.com/aliyun/alibaba-cloud-sdk-go/services/nas"
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"github.com/kubernetes-csi/drivers/pkg/csi-common"
+	csicommon "github.com/kubernetes-csi/drivers/pkg/csi-common"
 	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/dadi"
 	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/options"
 	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/utils"
@@ -44,9 +44,9 @@ const (
 	InstanceID         = "instance-id"
 	alinasUtilsName    = "aliyun-alinas-utils.noarch"
 	alinasUtils        = "aliyun-alinas-utils"
-	alinasUtilsRpmName = "aliyun-alinas-utils-1.1-4.al7.noarch.rpm"
-	alinasEac          = "alinas-eac"
-	alinasEacRpmName   = "alinas-eac-1.2-1.x86_64.rpm"
+	alinasUtilsRpmName = "aliyun-alinas-utils-1.1-6.al7.noarch.rpm"
+	alinasEfc          = "alinas-efc"
+	alinasEfcRpmName   = "alinas-efc-1.2-3.x86_64.rpm"
 )
 
 var (
@@ -121,6 +121,7 @@ func NewDriver(nodeID, endpoint, serviceType string) *NAS {
 	d.controllerServer = NewControllerServer(d.driver, c, regionID, limit, cfg)
 
 	GlobalConfigVar.NasClient = c
+	GlobalConfigVar.Region = regionID
 	return d
 }
 
@@ -219,37 +220,36 @@ func GlobalConfigSet(serviceType string) *restclient.Config {
 			}
 		}
 
-		if value, ok := configMap.Data["cnfs-cache-properties"]; ok {
-			if strings.Contains(value, "enable=true") {
-				//start go write cluster nodeIP to /etc/hosts
-				//format{["192.168.1.1:8800", "192.168.1.2:8801", "192.168.1.3:8802"]}
-				//get service endpoint->format json->write /etc/hosts/dadi-endpoint.json
-				if serviceType == utils.PluginService {
-					go dadi.Run(kubeClient)
-				}
+		_, ok1 := configMap.Data["cnfs-cache-properties"]
+		_, ok2 := configMap.Data["nas-efc-cache"]
+		if ok1 || ok2 {
+			//start go write cluster nodeIP to /etc/hosts
+			//format{["192.168.1.1:8800", "192.168.1.2:8801", "192.168.1.3:8802"]}
+			//get service endpoint->format json->write /etc/hosts/dadi-endpoint.json
+			if serviceType == utils.PluginService {
+				go dadi.Run(kubeClient)
 			}
 		}
-		if value, ok := configMap.Data["cpfs-nas-enable"]; ok {
-			if value == "enable" || value == "yes" || value == "true" {
-				if serviceType == utils.PluginService {
-					deleteRpm(alinasUtilsName)
-					installRpm(alinasUtils, alinasUtilsRpmName)
-				}
+		_, ok1 = configMap.Data["cpfs-nas-enable"]
+		if ok1 {
+			if serviceType == utils.PluginService {
+				deleteRpm(alinasUtilsName)
+				installRpm(alinasUtils, alinasUtilsRpmName)
 			}
 		}
 		if value, ok := configMap.Data["cnfs-client-properties"]; ok {
-			if strings.Contains(value, "enable=true") {
-				//install alinas rpm(alinas-eac alinas-utils) and cpfs rpm(alinas-utils)
+			if strings.Contains(value, "enable=true") || strings.Contains(value, "efc=true") {
+				//install alinas rpm(alinas-efc alinas-utils) and cpfs rpm(alinas-utils)
 				if serviceType == utils.PluginService {
 					//deleteRpm before installRpm
 					deleteRpm(alinasUtilsName)
 					installRpm(alinasUtils, alinasUtilsRpmName)
 					queryCmd := fmt.Sprintf("%s rpm -qa", NsenterCmd)
 					stdout, _ := utils.ValidateRun(queryCmd)
-					if strings.Contains(stdout, alinasEac) {
-						installRpm(alinasEac, alinasEacRpmName)
+					if strings.Contains(stdout, alinasEfc) {
+						installRpm(alinasEfc, alinasEfcRpmName)
 					} else {
-						upgradeRPM(stdout, alinasEac, alinasEacRpmName)
+						upgradeRPM(stdout, alinasEfc, alinasEfcRpmName)
 					}
 					runCmd := fmt.Sprintf("%s systemctl start aliyun-alinas-mount-watchdog", NsenterCmd)
 					_, err := utils.ValidateRun(runCmd)

@@ -23,7 +23,8 @@ import (
 	"strconv"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"github.com/kubernetes-csi/drivers/pkg/csi-common"
+	csicommon "github.com/kubernetes-csi/drivers/pkg/csi-common"
+	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/local/gc"
 	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/local/generator"
 	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/local/manager"
 	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/local/server"
@@ -33,7 +34,7 @@ import (
 	"golang.org/x/net/context"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	k8smount "k8s.io/mount-utils"
@@ -123,6 +124,9 @@ func NewNodeServer(d *csicommon.CSIDriver, dName, nodeID string) csi.NodeServer 
 	// watch pv/pvc annotations and provide volume manage
 	go generator.VolumeHandler()
 
+	// start garbage collecting
+	gc.Start(types.GlobalConfigVar)
+
 	// maintain pmem node
 	if types.GlobalConfigVar.PmemEnable {
 		manager.MaintainPMEM(types.GlobalConfigVar.PmemType, mounter)
@@ -185,6 +189,12 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		}
 	case MountPointType:
 		err := ns.mountMountPointVolume(ctx, req)
+		if err != nil {
+			log.Errorf("NodePublishVolume: mount mountpoint volume %s with path %s with error: %v", req.VolumeId, targetPath, err)
+			return nil, err
+		}
+	case QuotaPathVolumeType:
+		err := ns.mountQuotaPathVolume(ctx, req)
 		if err != nil {
 			log.Errorf("NodePublishVolume: mount mountpoint volume %s with path %s with error: %v", req.VolumeId, targetPath, err)
 			return nil, err

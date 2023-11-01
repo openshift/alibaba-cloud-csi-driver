@@ -24,8 +24,6 @@ import (
 	"io"
 	"io/fs"
 	"io/ioutil"
-	utilexec "k8s.io/utils/exec"
-	"k8s.io/utils/mount"
 	"net"
 	"net/http"
 	"os"
@@ -40,22 +38,21 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
+	utilexec "k8s.io/utils/exec"
+	"k8s.io/utils/mount"
+
 	"github.com/aliyun/alibaba-cloud-sdk-go/services/ecs"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/go-ping/ping"
 	log "github.com/sirupsen/logrus"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/record"
-	k8svol "k8s.io/kubernetes/pkg/volume"
-	k8sfs "k8s.io/kubernetes/pkg/volume/util/fs"
 
 	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/options"
 	k8smount "k8s.io/mount-utils"
@@ -112,10 +109,13 @@ const (
 
 	// socketPath is path of connector sock
 	socketPath = "/host/etc/csi-tool/connector.sock"
+
+	// GiB ...
+	GiB = 1024 * 1024 * 1024
 )
 
 // KubernetesAlicloudIdentity set a identity label
-var KubernetesAlicloudIdentity = fmt.Sprintf("Kubernetes.Alicloud/CsiPlugin")
+var KubernetesAlicloudIdentity = "Kubernetes.Alicloud/CsiPlugin"
 
 var (
 	// NodeAddrMap map for NodeID and its Address
@@ -233,6 +233,13 @@ func ValidateRun(cmd string) (string, error) {
 	}
 	log.Infof("Exec command %s is successfully, name:%s, args:%+v", cmd, name, args)
 	return string(stdout), nil
+}
+
+var NsenterArgs = []string{"--target=1", "--mount", "--ipc", "--net", "--uts", "--"}
+
+func CommandOnNode(args ...string) *exec.Cmd {
+	allArgs := append(NsenterArgs, args...)
+	return exec.Command("/nsenter", allArgs...)
 }
 
 // run shell command
@@ -447,7 +454,38 @@ func GetRegionIDAndInstanceID(nodeName string) (string, string, error) {
 }
 
 func Gi2Bytes(gb int64) int64 {
-	return gb * 1024 * 1024 * 1024
+	return gb * GiB
+}
+
+// BytesToGiB converts Bytes to GiB
+func Bytes2GiB(volumeSizeBytes int64) int64 {
+	return volumeSizeBytes / GiB
+}
+
+// RoundUpBytes rounds up the volume size in bytes upto multiplications of GiB
+// in the unit of Bytes
+func RoundUpBytes(volumeSizeBytes int64) int64 {
+	return roundUpSize(volumeSizeBytes, GiB) * GiB
+}
+
+// RoundUpGiB rounds up the volume size in bytes upto multiplications of GiB
+// in the unit of GiB
+func RoundUpGiB(volumeSizeBytes int64) int64 {
+	return roundUpSize(volumeSizeBytes, GiB)
+}
+
+// BytesToGiB converts Bytes to GiB
+func BytesToGiB(volumeSizeBytes int64) int64 {
+	return volumeSizeBytes / GiB
+}
+
+// TODO: check division by zero and int overflow
+func roundUpSize(volumeSizeBytes int64, allocationUnitBytes int64) int64 {
+	return (volumeSizeBytes + allocationUnitBytes - 1) / allocationUnitBytes
+}
+
+func KBlock2Bytes(kblocks int64) int64 {
+	return kblocks * 1024
 }
 
 // ReadJSONFile return a json object
@@ -497,62 +535,37 @@ func GetMetrics(path string) (*csi.NodeGetVolumeStatsResponse, error) {
 	if path == "" {
 		return nil, fmt.Errorf("getMetrics No path given")
 	}
-	available, capacity, usage, inodes, inodesFree, inodesUsed, err := k8sfs.FsInfo(path)
+	statfs := &unix.Statfs_t{}
+	err := unix.Statfs(path, statfs)
 	if err != nil {
 		return nil, err
 	}
 
-	metrics := &k8svol.Metrics{Time: metav1.Now()}
-	metrics.Available = resource.NewQuantity(available, resource.BinarySI)
-	metrics.Capacity = resource.NewQuantity(capacity, resource.BinarySI)
-	metrics.Used = resource.NewQuantity(usage, resource.BinarySI)
-	metrics.Inodes = resource.NewQuantity(inodes, resource.BinarySI)
-	metrics.InodesFree = resource.NewQuantity(inodesFree, resource.BinarySI)
-	metrics.InodesUsed = resource.NewQuantity(inodesUsed, resource.BinarySI)
+	// Available is blocks available * fragment size
+	available := int64(statfs.Bavail) * int64(statfs.Bsize)
 
-	metricAvailable, ok := (*(metrics.Available)).AsInt64()
-	if !ok {
-		log.Errorf("failed to fetch available bytes for target: %s", path)
-		return nil, status.Error(codes.Unknown, "failed to fetch available bytes")
-	}
-	metricCapacity, ok := (*(metrics.Capacity)).AsInt64()
-	if !ok {
-		log.Errorf("failed to fetch capacity bytes for target: %s", path)
-		return nil, status.Error(codes.Unknown, "failed to fetch capacity bytes")
-	}
-	metricUsed, ok := (*(metrics.Used)).AsInt64()
-	if !ok {
-		log.Errorf("failed to fetch used bytes for target %s", path)
-		return nil, status.Error(codes.Unknown, "failed to fetch used bytes")
-	}
-	metricInodes, ok := (*(metrics.Inodes)).AsInt64()
-	if !ok {
-		log.Errorf("failed to fetch available inodes for target %s", path)
-		return nil, status.Error(codes.Unknown, "failed to fetch available inodes")
-	}
-	metricInodesFree, ok := (*(metrics.InodesFree)).AsInt64()
-	if !ok {
-		log.Errorf("failed to fetch free inodes for target: %s", path)
-		return nil, status.Error(codes.Unknown, "failed to fetch free inodes")
-	}
-	metricInodesUsed, ok := (*(metrics.InodesUsed)).AsInt64()
-	if !ok {
-		log.Errorf("failed to fetch used inodes for target: %s", path)
-		return nil, status.Error(codes.Unknown, "failed to fetch used inodes")
-	}
+	// Capacity is total block count * fragment size
+	capacity := int64(statfs.Blocks) * int64(statfs.Bsize)
+
+	// Usage is block being used * fragment size (aka block size).
+	usage := (int64(statfs.Blocks) - int64(statfs.Bfree)) * int64(statfs.Bsize)
+
+	inodes := int64(statfs.Files)
+	inodesFree := int64(statfs.Ffree)
+	inodesUsed := inodes - inodesFree
 
 	return &csi.NodeGetVolumeStatsResponse{
 		Usage: []*csi.VolumeUsage{
 			{
-				Available: metricAvailable,
-				Total:     metricCapacity,
-				Used:      metricUsed,
+				Available: available,
+				Total:     capacity,
+				Used:      usage,
 				Unit:      csi.VolumeUsage_BYTES,
 			},
 			{
-				Available: metricInodesFree,
-				Total:     metricInodes,
-				Used:      metricInodesUsed,
+				Available: inodesFree,
+				Total:     inodes,
+				Used:      inodesUsed,
 				Unit:      csi.VolumeUsage_INODES,
 			},
 		},
@@ -571,6 +584,16 @@ func GetFileContent(fileName string) string {
 	}
 	devicePath := strings.TrimSpace(string(value))
 	return devicePath
+}
+
+// GetAccessModes returns a slice containing all of the access modes defined
+// in the passed in VolumeCapabilities.
+func GetAccessModes(caps []*csi.VolumeCapability) *[]string {
+	modes := []string{}
+	for _, c := range caps {
+		modes = append(modes, c.AccessMode.GetMode().String())
+	}
+	return &modes
 }
 
 // WriteJSONFile save json data to file
@@ -923,8 +946,16 @@ func WriteMetricsInfo(metricsPathPrefix string, req *csi.NodePublishVolumeReques
 	}
 }
 
+func ParseProviderID(providerID string) string {
+	providers := strings.Split(providerID, ".")
+	if len(providers) != 2 {
+		return ""
+	}
+	return providers[1]
+}
+
 // formatAndMount uses unix utils to format and mount the given disk
-func FormatAndMount(diskMounter *k8smount.SafeFormatAndMount, source string, target string, fstype string, mkfsOptions []string, mountOptions []string) error {
+func FormatAndMount(diskMounter *k8smount.SafeFormatAndMount, source string, target string, fstype string, mkfsOptions []string, mountOptions []string, omitFsCheck bool) error {
 	log.Infof("formatAndMount: mount options : %+v", mountOptions)
 	readOnly := false
 	for _, option := range mountOptions {
@@ -936,7 +967,7 @@ func FormatAndMount(diskMounter *k8smount.SafeFormatAndMount, source string, tar
 
 	// check device fs
 	mountOptions = append(mountOptions, "defaults")
-	if !readOnly {
+	if !readOnly || !omitFsCheck {
 		// Run fsck on the disk to fix repairable issues, only do this for volumes requested as rw.
 		args := []string{"-a", source}
 
@@ -965,56 +996,127 @@ func FormatAndMount(diskMounter *k8smount.SafeFormatAndMount, source string, tar
 			return err
 		}
 		if existingFormat == "" {
-			if readOnly {
-				// Don't attempt to format if mounting as readonly, return an error to reflect this.
-				return errors.New("failed to mount unformatted volume as read only")
-			}
-
-			// Disk is unformatted so format it.
-			args := []string{source}
-			// Use 'ext4' as the default
-			if len(fstype) == 0 {
-				fstype = "ext4"
-			}
-
-			if fstype == "ext4" || fstype == "ext3" {
-				args = []string{
-					"-F",  // Force flag
-					"-m0", // Zero blocks reserved for super-user
-					source,
-				}
-				// add mkfs options
-				if len(mkfsOptions) != 0 {
-					args = []string{}
-					for _, opts := range mkfsOptions {
-						args = append(args, opts)
-					}
-					args = append(args, source)
-				}
-			}
-			log.Infof("Disk %q appears to be unformatted, attempting to format as type: %q with options: %v", source, fstype, args)
-			startT := time.Now()
-
-			pvName := filepath.Base(source)
-			_, err := diskMounter.Exec.Command("mkfs."+fstype, args...).CombinedOutput()
-			log.Infof("Disk format finished, pvName: %s elapsedTime: %+v ms", pvName, time.Now().Sub(startT).Milliseconds())
-			if err == nil {
-				// the disk has been formatted successfully try to mount it again.
-				return diskMounter.Interface.Mount(source, target, fstype, mountOptions)
-			}
-			log.Errorf("format of disk %q failed: type:(%q) target:(%q) options:(%q) error:(%v)", source, fstype, target, args, err)
-			return err
+			return FormatNewDisk(readOnly, source, fstype, target, mkfsOptions, mountOptions, diskMounter)
 		}
 		// Disk is already formatted and failed to mount
 		if len(fstype) == 0 || fstype == existingFormat {
 			// This is mount error
 			return mountErr
 		}
+		// Detect if an encrypted disk is empty disk, since atari type partition is detected by blkid.
+		if existingFormat == "unknown data, probably partitions" {
+			log.Infof("FormatAndMount: enter special partition logics")
+			fsType, ptType, _ := GetDiskPtypePTtype(source)
+			if fsType == "" && ptType == "atari" {
+				return FormatNewDisk(readOnly, source, fstype, target, mkfsOptions, mountOptions, diskMounter)
+			}
+		}
 		// Block device is formatted with unexpected filesystem, let the user know
 		return fmt.Errorf("failed to mount the volume as %q, it already contains %s. Mount error: %v", fstype, existingFormat, mountErr)
 	}
 
 	return mountErr
+}
+
+func FormatNewDisk(readOnly bool, source, fstype, target string, mkfsOptions, mountOptions []string, diskMounter *k8smount.SafeFormatAndMount) error {
+	if readOnly {
+		// Don't attempt to format if mounting as readonly, return an error to reflect this.
+		return errors.New("failed to mount unformatted volume as read only")
+	}
+
+	// Use 'ext4' as the default
+	if len(fstype) == 0 {
+		fstype = "ext4"
+	}
+
+	args := mkfsDefaultArgs(fstype, source)
+
+	// add mkfs options
+	if len(mkfsOptions) != 0 {
+		args = []string{}
+		args = append(args, mkfsOptions...)
+		args = append(args, source)
+	}
+
+	log.Infof("Disk %q appears to be unformatted, attempting to format as type: %q with options: %v", source, fstype, args)
+	startT := time.Now()
+
+	pvName := filepath.Base(source)
+	_, err := diskMounter.Exec.Command("mkfs."+fstype, args...).CombinedOutput()
+	if err == nil {
+		// the disk has been formatted successfully try to mount it again.
+		log.Infof("Disk format successed, pvName: %s elapsedTime: %+v ms", pvName, time.Now().Sub(startT).Milliseconds())
+		return diskMounter.Interface.Mount(source, target, fstype, mountOptions)
+	}
+	log.Errorf("format of disk %q failed: type:(%q) target:(%q) options:(%q) error:(%v)", source, fstype, target, args, err)
+	return err
+}
+
+func mkfsDefaultArgs(fstype, source string) (args []string) {
+	// default args
+	if fstype == "ext4" || fstype == "ext3" {
+		args = []string{
+			"-F",  // Force flag
+			"-m0", // Zero blocks reserved for super-user
+			source,
+		}
+	} else if fstype == "xfs" {
+		args = []string{
+			"-f",
+			source,
+		}
+	}
+	return
+}
+
+// GetDiskPtypePTtype uses 'blkid' to see if the given disk is unformatted
+func GetDiskPtypePTtype(disk string) (fstype string, pttype string, err error) {
+	args := []string{"-p", "-s", "TYPE", "-s", "PTTYPE", "-o", "export", disk}
+
+	diskMounter := &k8smount.SafeFormatAndMount{Interface: k8smount.New(""), Exec: utilexec.New()}
+	dataOut, err := diskMounter.Exec.Command("blkid", args...).CombinedOutput()
+	output := string(dataOut)
+
+	if err != nil {
+		if exit, ok := err.(utilexec.ExitError); ok {
+			if exit.ExitStatus() == 2 {
+				// Disk device is unformatted.
+				// For `blkid`, if the specified token (TYPE/PTTYPE, etc) was
+				// not found, or no (specified) devices could be identified, an
+				// exit code of 2 is returned.
+				return "", "", nil
+			}
+		}
+		log.Errorf("Could not determine if disk %q is formatted (%v)", disk, err)
+		return "", "", err
+	}
+
+	lines := strings.Split(output, "\n")
+	for _, l := range lines {
+		if len(l) <= 0 {
+			// Ignore empty line.
+			continue
+		}
+		cs := strings.Split(l, "=")
+		if len(cs) != 2 {
+			return "", "", fmt.Errorf("blkid returns invalid output: %s", output)
+		}
+		// TYPE is filesystem type, and PTTYPE is partition table type, according
+		// to https://www.kernel.org/pub/linux/utils/util-linux/v2.21/libblkid-docs/.
+		if cs[0] == "TYPE" {
+			fstype = cs[1]
+		} else if cs[0] == "PTTYPE" {
+			pttype = cs[1]
+		}
+	}
+
+	if len(pttype) > 0 {
+		// Returns a special non-empty string as filesystem type, then kubelet
+		// will not format it.
+		return fstype, pttype, nil
+	}
+
+	return fstype, "", nil
 }
 
 func HasSpecificTagKey(tagKey string, disk *ecs.Disk) (bool, string) {

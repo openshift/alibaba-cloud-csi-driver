@@ -2,13 +2,14 @@ package metric
 
 import (
 	"fmt"
+	"net/http"
+	"strings"
+	"sync"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/version"
 	"github.com/sirupsen/logrus"
-	"net/http"
-	"strings"
-	"sync"
 )
 
 // Handler is a package of promHttp,metric entry
@@ -38,11 +39,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // NewMetricHandler method returns a promHttp object
-func NewMetricHandler(serviceType string) *Handler {
-
-	setServiceType(serviceType)
+func NewMetricHandler(serviceType string, driverNames []string) *Handler {
 	//csi collector singleton
-	err := newCSICollector()
+	err := newCSICollector(serviceType, driverNames)
 	if err != nil {
 		logrus.Errorf("Couldn't create collector: %s", err)
 	}
@@ -56,7 +55,7 @@ func (h *Handler) innerHandler() (http.Handler, error) {
 		return nil, fmt.Errorf("Couldn't register node collector: %s", err)
 	}
 	handler := promhttp.HandlerFor(
-		prometheus.Gatherers{r},
+		r,
 		promhttp.HandlerOpts{
 			ErrorHandling: promhttp.ContinueOnError,
 		},
@@ -70,8 +69,4 @@ func newHandler() *Handler {
 		logrus.Errorf("Couldn't create metrics handler: %s", err)
 	}
 	return h
-}
-
-func setServiceType(serviceType string) {
-	metricType = serviceType
 }

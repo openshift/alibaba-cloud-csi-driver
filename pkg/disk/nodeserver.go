@@ -62,6 +62,8 @@ const (
 	SharedEnable = "shared"
 	// SysConfigTag tag
 	SysConfigTag = "sysConfig"
+	// SysConfigTag tag
+	OmitFilesystemCheck = "omitfsck"
 	// MkfsOptions tag
 	MkfsOptions = "mkfsOptions"
 	// DiskTagedByPlugin tag
@@ -148,26 +150,24 @@ func NewNodeServer(d *csicommon.CSIDriver, c *ecs.Client) csi.NodeServer {
 		maxVolumesNum = getVolumeCount()
 	}
 
-	zoneID := ""
+	zoneID := GlobalConfigVar.ZoneID
 	nodeID := GlobalConfigVar.NodeID
 	internalMode := os.Getenv("INTERNAL_MODE")
 	if internalMode == "true" {
 		zoneID, nodeID = getZoneID(c, nodeID)
 	} else {
-		doc, err := retryGetInstanceDoc()
-		if err != nil || doc == nil || (doc != nil && doc.ZoneID == "") {
-			// these branch means metadata server is down, when nodeID equals nodeName, we can get nessary message from apiserver
-			log.Log.Infof("NewNodeServer: get instance meta info failed from metadataserver, start to get info from node labels")
+		if zoneID == "" || nodeID == "" {
 			zoneID, nodeID = getZoneID(c, nodeID)
-		} else {
-			zoneID = doc.ZoneID
-			nodeID = doc.InstanceID
 		}
 	}
 	log.Log.Infof("NewNodeServer: zone id: %+v, GlobalConfigVar.zoneID: %s", zoneID, GlobalConfigVar.ZoneID)
 	// !strings.HasPrefix(zoneID, GlobalConfigVar.Region) is forbidden ex: regionId: ap-southeast-1 zoneId: ap-southeast-x
 	if GlobalConfigVar.ZoneID == "" {
 		GlobalConfigVar.ZoneID = zoneID
+	}
+
+	if GlobalConfigVar.NodeID == "" {
+		GlobalConfigVar.NodeID = nodeID
 	}
 
 	// Create Directory
@@ -180,7 +180,11 @@ func NewNodeServer(d *csicommon.CSIDriver, c *ecs.Client) csi.NodeServer {
 	} else {
 		log.Log.Infof("Currently node is NOT VF model")
 	}
-	go UpdateNode(nodeID, c)
+	go UpdateNode(GlobalConfigVar.NodeID, c)
+
+	if GlobalConfigVar.CheckBDFHotPlugin {
+		go checkVfhpOnlineReconcile()
+	}
 
 	if !GlobalConfigVar.ControllerService && IsVFNode() && GlobalConfigVar.BdfHealthCheck {
 		go BdfHealthCheck()
@@ -189,7 +193,7 @@ func NewNodeServer(d *csicommon.CSIDriver, c *ecs.Client) csi.NodeServer {
 	return &nodeServer{
 		zone:              GlobalConfigVar.ZoneID,
 		maxVolumesPerNode: maxVolumesNum,
-		nodeID:            nodeID,
+		nodeID:            GlobalConfigVar.NodeID,
 		DefaultNodeServer: csicommon.NewDefaultNodeServer(d),
 		mounter:           utils.NewMounter(),
 		k8smounter:        k8smount.New(""),
@@ -256,7 +260,7 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 			return nil, status.Errorf(codes.Internal, "NodePublishVolume: cannot get pod runtime: %v", err)
 		} else if runtime == RunvRunTimeMode {
 			log.Log.Infof("NodePublishVolume:: Kata Disk Volume %s Mount with: %v", req.VolumeId, req)
-			// umount the stage path, which is mounted in Stage
+			// umount the stage path, which is mounted in Stage (tmpfs)
 			if err := ns.unmountStageTarget(sourcePath); err != nil {
 				log.Log.Errorf("NodePublishVolume(runv): unmountStageTarget %s with error: %s", sourcePath, err.Error())
 				return nil, status.Error(codes.InvalidArgument, "NodePublishVolume: unmountStageTarget "+sourcePath+" with error: "+err.Error())
@@ -604,22 +608,24 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 				}
 				return nil, status.Errorf(codes.Aborted, "NodeStageVolume: failed to attach bdf disk: %v", err)
 			}
-			devicePaths, err = GetDeviceByVolumeID(req.GetVolumeId())
-			if bdf != "" && len(devicePaths) == 0 {
+			// devicePaths, err = GetDeviceByVolumeID(req.GetVolumeId())
+			if bdf != "" {
 				device, err = GetDeviceByBdf(bdf, true)
 			}
-		}
-		if err != nil {
-			log.Log.Errorf("NodeStageVolume: ADController Enabled, but device can't be found in node: %s, error: %s", req.VolumeId, err.Error())
-			return nil, status.Error(codes.Aborted, "NodeStageVolume: ADController Enabled, but device can't be found:"+req.VolumeId+err.Error())
-		}
+			log.Log.Infof("NodeStageVolume: enabled bdf mode, device: %s, bdf: %s", device, bdf)
+		} else {
+			if err != nil {
+				log.Log.Errorf("NodeStageVolume: ADController Enabled, but device can't be found in node: %s, error: %s", req.VolumeId, err.Error())
+				return nil, status.Error(codes.Aborted, "NodeStageVolume: ADController Enabled, but device can't be found:"+req.VolumeId+err.Error())
+			}
 
-		rootDevice, subDevice, err := GetRootSubDevicePath(devicePaths)
-		if err != nil {
-			log.Log.Errorf("NodeStageVolume: ADController Enabled, but device can't be found in node: %s, error: %s", req.VolumeId, err.Error())
-			return nil, status.Error(codes.Aborted, "NodeStageVolume: ADController Enabled, but device can't be found:"+req.VolumeId+err.Error())
+			rootDevice, subDevice, err := GetRootSubDevicePath(devicePaths)
+			if err != nil {
+				log.Log.Errorf("NodeStageVolume: ADController Enabled, but device can't be found in node: %s, error: %s", req.VolumeId, err.Error())
+				return nil, status.Error(codes.Aborted, "NodeStageVolume: ADController Enabled, but device can't be found:"+req.VolumeId+err.Error())
+			}
+			device = ChooseDevice(rootDevice, subDevice)
 		}
-		device = ChooseDevice(rootDevice, subDevice)
 	} else {
 		device, err = attachDisk(req.VolumeContext[TenantUserUID], req.GetVolumeId(), ns.nodeID, isSharedDisk)
 		if err != nil {
@@ -658,6 +664,10 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 			}
 		}
 	}
+	omitfsck := false
+	if disable, ok := req.VolumeContext[OmitFilesystemCheck]; ok && disable == "true" {
+		omitfsck = true
+	}
 
 	// Block volume not need to format
 	if isBlock {
@@ -693,17 +703,21 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 
 	// do format-mount or mount
 	diskMounter := &k8smount.SafeFormatAndMount{Interface: ns.k8smounter, Exec: utilexec.New()}
-	if len(mkfsOptions) > 0 && (fsType == "ext4" || fsType == "ext3") {
-		if err := utils.FormatAndMount(diskMounter, device, targetPath, fsType, mkfsOptions, mountOptions); err != nil {
-			log.Log.Errorf("Mountdevice: FormatAndMount fail with mkfsOptions %s, %s, %s, %s, %s with error: %s", device, targetPath, fsType, mkfsOptions, mountOptions, err.Error())
-			return nil, status.Error(codes.Internal, err.Error())
-		}
-	} else {
-		if err := diskMounter.FormatAndMount(device, targetPath, fsType, mountOptions); err != nil {
-			log.Log.Errorf("NodeStageVolume: Volume: %s, Device: %s, FormatAndMount error: %s", req.VolumeId, device, err.Error())
-			return nil, status.Error(codes.Internal, err.Error())
-		}
+	if err := utils.FormatAndMount(diskMounter, device, targetPath, fsType, mkfsOptions, mountOptions, omitfsck); err != nil {
+		log.Log.Errorf("Mountdevice: FormatAndMount fail with mkfsOptions %s, %s, %s, %s, %s with error: %s", device, targetPath, fsType, mkfsOptions, mountOptions, err.Error())
+		return nil, status.Error(codes.Internal, err.Error())
 	}
+	// if len(mkfsOptions) > 0 && (fsType == "ext4" || fsType == "ext3") {
+	// 	if err := utils.FormatAndMount(diskMounter, device, targetPath, fsType, mkfsOptions, mountOptions, GlobalConfigVar.OmitFilesystemCheck); err != nil {
+	// 		log.Log.Errorf("Mountdevice: FormatAndMount fail with mkfsOptions %s, %s, %s, %s, %s with error: %s", device, targetPath, fsType, mkfsOptions, mountOptions, err.Error())
+	// 		return nil, status.Error(codes.Internal, err.Error())
+	// 	}
+	// } else {
+	// 	if err := diskMounter.FormatAndMount(device, targetPath, fsType, mountOptions); err != nil {
+	// 		log.Log.Errorf("NodeStageVolume: Volume: %s, Device: %s, FormatAndMount error: %s", req.VolumeId, device, err.Error())
+	// 		return nil, status.Error(codes.Internal, err.Error())
+	// 	}
+	// }
 	log.Log.Infof("NodeStageVolume: Mount Successful: volumeId: %s target %v, device: %s, mkfsOptions: %v, options: %v", req.VolumeId, targetPath, device, mkfsOptions, mountOptions)
 	_, pvc, err := getPvPvcFromDiskId(req.VolumeId)
 	if err != nil {
@@ -725,6 +739,7 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 			}
 		}
 	}
+
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
@@ -802,6 +817,16 @@ func (ns *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 	if IsVFNode() {
 		if err := unbindBdfDisk(req.VolumeId); err != nil {
 			log.Log.Errorf("NodeUnstageVolume: unbind bdf disk %s with error: %v", req.VolumeId, err)
+			return nil, err
+		}
+	}
+	if IsVFInstance() && !IsVFNode() {
+		bdf, err := findBdf(req.VolumeId)
+		if err != nil {
+			return nil, err
+		}
+		if err := clearBdfInfo(req.VolumeId, bdf); err != nil {
+			log.Log.Errorf("NodeUnstagedVolume: clear disk bdf info %s with err: %s", req.VolumeId, err)
 			return nil, err
 		}
 	}
@@ -1023,16 +1048,9 @@ func (ns *nodeServer) mountDeviceToGlobal(capability *csi.VolumeCapability, volu
 
 	// do format-mount or mount
 	diskMounter := &k8smount.SafeFormatAndMount{Interface: ns.k8smounter, Exec: utilexec.New()}
-	if len(mkfsOptions) > 0 && (fsType == "ext4" || fsType == "ext3") {
-		if err := utils.FormatAndMount(diskMounter, device, sourcePath, fsType, mkfsOptions, mountOptions); err != nil {
-			log.Log.Errorf("mountDeviceToGlobal: FormatAndMount fail with mkfsOptions %s, %s, %s, %s, %s with error: %s", device, sourcePath, fsType, mkfsOptions, mountOptions, err.Error())
-			return status.Error(codes.Internal, err.Error())
-		}
-	} else {
-		if err := diskMounter.FormatAndMount(device, sourcePath, fsType, mountOptions); err != nil {
-			log.Log.Errorf("mountDeviceToGlobal: Device: %s, FormatAndMount error: %s", device, err.Error())
-			return status.Error(codes.Internal, err.Error())
-		}
+	if err := utils.FormatAndMount(diskMounter, device, sourcePath, fsType, mkfsOptions, mountOptions, GlobalConfigVar.OmitFilesystemCheck); err != nil {
+		log.Log.Errorf("mountDeviceToGlobal: FormatAndMount fail with mkfsOptions %s, %s, %s, %s, %s with error: %s", device, sourcePath, fsType, mkfsOptions, mountOptions, err.Error())
+		return status.Error(codes.Internal, err.Error())
 	}
 	return nil
 }
@@ -1044,7 +1062,7 @@ func (ns *nodeServer) unmountDuplicateMountPoint(targetPath, volumeId string) er
 	if partsLen > 2 && pathParts[partsLen-1] == "mount" {
 		globalPath2 := filepath.Join("/var/lib/container/kubelet/plugins/kubernetes.io/csi/pv/", pathParts[partsLen-2], "/globalmount")
 
-		result := sha256.Sum256([]byte(fmt.Sprintf("%s", volumeId)))
+		result := sha256.Sum256([]byte(volumeId))
 		volSha := fmt.Sprintf("%x", result)
 		globalPath3 := filepath.Join("/var/lib/container/kubelet/plugins/kubernetes.io/csi/", driverName, volSha, "/globalmount")
 		var err error

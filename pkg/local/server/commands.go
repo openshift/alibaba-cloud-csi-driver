@@ -176,8 +176,7 @@ func getPVNumber(vgName string) int {
 // ProtectedTagName is a tag that prevents RemoveLV & RemoveVG from removing a volume
 const ProtectedTagName = "protected"
 
-// RemoveLV removes a volume
-func RemoveLV(ctx context.Context, vg string, name string) (string, error) {
+func removeLV(ctx context.Context, vg string, name string, extraOpts ...string) (string, error) {
 	if !utils.CheckParameterValidate([]string{vg, name}) {
 		return "", fmt.Errorf("inputs illegal: %s, %s", vg, name)
 	}
@@ -198,11 +197,23 @@ func RemoveLV(ctx context.Context, vg string, name string) (string, error) {
 		}
 	}
 
-	args := []string{NsenterCmd, "lvremove", "-v", "-f", fmt.Sprintf("%s/%s", vg, name)}
+	args := append([]string{NsenterCmd, "lvremove"}, extraOpts...)
+	args = append(args, fmt.Sprintf("%s/%s", vg, name))
 	cmd := strings.Join(args, " ")
 	out, err := utils.Run(cmd)
 
 	return string(out), err
+}
+
+// RemoveLV removes a volume
+func RemoveLV(ctx context.Context, vg string, name string) (string, error) {
+	return removeLV(ctx, vg, name, "-v", "-f")
+}
+
+// SafeRemoveLV removes an LV without utilizing the "-f" option.
+// As a result, if the LV is currently mounted, an error will be prompted.
+func SafeRemoveLV(ctx context.Context, vg, name string) (string, error) {
+	return removeLV(ctx, vg, name, "-v", "-y")
 }
 
 // CloneLV clones a volume via dd
@@ -220,30 +231,13 @@ func CloneLV(ctx context.Context, src, dest string) (string, error) {
 }
 
 // ListVG get vg info
-func ListVG() ([]*lib.VG, error) {
-	args := []string{NsenterCmd, "vgs", "--units=b", "--separator=\"<:SEP:>\"", "--nosuffix", "--noheadings",
-		"-o", "vg_name,vg_size,vg_free,vg_uuid,vg_tags,pv_count", "--nameprefixes", "-a"}
-	cmd := strings.Join(args, " ")
-	out, err := utils.Run(cmd)
+func ListVG() ([]lib.VG, error) {
+	out, err := utils.CommandOnNode("vgs", "--reportformat", "json", "--units", "b", "-o", "vg_name,vg_size,vg_free,vg_uuid,vg_tags,pv_count", "--nosuffix").Output()
 	if err != nil {
 		return nil, err
 	}
-	outStr := strings.TrimSpace(string(out))
-	outLines := strings.Split(outStr, "\n")
 
-	vgs := []*lib.VG{}
-	for _, line := range outLines {
-		line = strings.TrimSpace(line)
-		if !strings.Contains(line, "LVM2_VG_NAME") {
-			continue
-		}
-		vg, err := lib.ParseVG(line)
-		if err != nil {
-			return nil, err
-		}
-		vgs = append(vgs, vg)
-	}
-	return vgs, nil
+	return lib.ParseVGs(out)
 }
 
 // CreateVG create volume group
@@ -276,9 +270,9 @@ func RemoveVG(ctx context.Context, name string) (string, error) {
 		return "", fmt.Errorf("failed to list VGs: %v", err)
 	}
 	var vg *lib.VG
-	for _, v := range vgs {
+	for i, v := range vgs {
 		if v.Name == name {
-			vg = v
+			vg = &vgs[i]
 			break
 		}
 	}
@@ -436,14 +430,14 @@ func RemoveNameSpace(ctx context.Context, namespaceName string) (string, error) 
 		return "namespace  " + namespaceName + " not found, skip", nil
 	}
 
-	args := []string{NsenterCmd, "ndctl", "disable-namespace", fmt.Sprintf("%s", namespace.Dev)}
+	args := []string{NsenterCmd, "ndctl", "disable-namespace", namespace.Dev}
 	cmd := strings.Join(args, " ")
 	_, err = utils.Run(cmd)
 	if err != nil {
 		return "", fmt.Errorf("failed to disable namespace with error: %v", err)
 	}
 
-	args = []string{NsenterCmd, "ndctl", "destroy-namespace", fmt.Sprintf("%s", namespace.Dev)}
+	args = []string{NsenterCmd, "ndctl", "destroy-namespace", namespace.Dev}
 	cmd = strings.Join(args, " ")
 	_, err = utils.Run(cmd)
 	if err != nil {

@@ -9,6 +9,8 @@ import (
 	"sync"
 
 	"github.com/emirpasic/gods/sets/hashset"
+	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/options"
+	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/utils"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
@@ -17,10 +19,6 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/kubernetes/pkg/volume/util/fs"
-
-	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/options"
-	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/utils"
 )
 
 var (
@@ -29,7 +27,8 @@ var (
 
 const (
 	// GBSIZE metrics
-	GBSIZE = 1024 * 1024 * 1024
+	GBSIZE          = 1024 * 1024 * 1024
+	NFSMetricsCount = 16
 )
 
 var (
@@ -170,6 +169,7 @@ type nfsCapacityInfo struct {
 
 type nfsStatCollector struct {
 	descs                       []typedFactorDesc
+	pvInfoLock                  sync.Mutex
 	lastPvNfsInfoMap            map[string]nfsInfo
 	lastPvStatsMap              sync.Map
 	clientSet                   *kubernetes.Clientset
@@ -181,7 +181,7 @@ type nfsStatCollector struct {
 }
 
 func init() {
-	registerCollector("nfs_stat", NewNfsStatCollector)
+	registerCollector("nfs_stat", NewNfsStatCollector, nasDriverName)
 }
 
 func parseNfsThreshold(defaultCapacityPercentageThreshold float64) (*hashset.Set, float64) {
@@ -237,6 +237,7 @@ func NewNfsStatCollector() (Collector, error) {
 			{desc: nfsWritesQueueTimeMilliSecondsDesc, valueType: prometheus.CounterValue, factor: .001},
 			{desc: nfsWritesRttTimeMilliSecondsDesc, valueType: prometheus.CounterValue, factor: .001},
 			{desc: nfsWritesExecuteTimeMilliSecondsDesc, valueType: prometheus.CounterValue, factor: .001},
+			// capacity
 			{desc: nfsCapacityTotalDesc, valueType: prometheus.CounterValue},
 			{desc: nfsCapacityUsedDesc, valueType: prometheus.CounterValue},
 			{desc: nfsCapacityAvailableDesc, valueType: prometheus.CounterValue},
@@ -266,15 +267,21 @@ func (p *nfsStatCollector) Update(ch chan<- prometheus.Metric) error {
 	if err != nil {
 		return err
 	}
+	//log.Infof("volJSONPaths:%+v", volJSONPaths)
 	p.updateMap(&p.lastPvNfsInfoMap, volJSONPaths, nasDriverName, "volumes")
-
+	//log.Infof("lastPvNfsInfoMap:%+v", p.lastPvNfsInfoMap)
 	wg := sync.WaitGroup{}
 	for pvName, stats := range pvNameStatsMap {
 		nfsInfo := p.lastPvNfsInfoMap[pvName]
-		err := getNfsCapacityStat(pvName, nfsInfo, &stats, p)
+		// log.Infof("pv: %s, stats: %v, nfsInfo: %+v", pvName, stats, nfsInfo)
+		capacityStats, err := getNfsCapacityStat(pvName, nfsInfo, p)
 		if err != nil {
-			continue
+			// log.Errorf("get capacity of PV %s: %v", pvName, err)
+			stats = append(stats, UnknownValue, UnknownValue, UnknownValue)
+		} else {
+			stats = append(stats, capacityStats...)
 		}
+
 		wg.Add(1)
 		go func(pvNameArgs string, pvcNamespaceArgs string, pvcNameArgs string, serverNameArgs string, statsArgs []string) {
 			defer wg.Done()
@@ -293,6 +300,9 @@ func (p *nfsStatCollector) setNfsMetric(pvName string, pvcNamespace string, pvcN
 		if i >= len(p.descs) {
 			return
 		}
+		if value == UnknownValue {
+			continue
+		}
 
 		valueFloat64, err := strconv.ParseFloat(value, 64)
 		if err != nil {
@@ -308,18 +318,15 @@ func (p *nfsStatCollector) updateMap(lastPvNfsInfoMap *map[string]nfsInfo, jsonP
 	thisPvNfsInfoMap := make(map[string]nfsInfo, 0)
 	lineArr, err := utils.RunWithFilter("mount", "nfs", "csi", keyword)
 	if err != nil {
+		log.Errorf("Failed to execute 'mount': %v", err)
 		p.updateNfsInfoMap(thisPvNfsInfoMap, lastPvNfsInfoMap)
-		return
-	}
-	if err != nil {
-		log.Errorf("Execute command nfs is failed, err: %s", err)
 		return
 	}
 	for _, path := range jsonPaths {
 		//Get nfs pvName
 		pvName, _, err := getVolumeInfoByJSON(path, deriverName)
 		if err != nil {
-			if err.Error() != "VolumeType is not the expected type" {
+			if err != ErrUnexpectedVolumeType {
 				log.Errorf("Get volume info by path %s is failed, err:%s", path, err)
 			}
 			continue
@@ -342,6 +349,9 @@ func (p *nfsStatCollector) updateMap(lastPvNfsInfoMap *map[string]nfsInfo, jsonP
 }
 
 func (p *nfsStatCollector) updateNfsInfoMap(thisPvNfsInfoMap map[string]nfsInfo, lastPvNfsInfoMap *map[string]nfsInfo) {
+	p.pvInfoLock.Lock()
+	defer p.pvInfoLock.Unlock()
+
 	for pv, thisInfo := range thisPvNfsInfoMap {
 		lastInfo, ok := (*lastPvNfsInfoMap)[pv]
 		// add and modify
@@ -398,6 +408,9 @@ func addNfsStat(pvNameStatMapping *map[string][]string, mountPath string, operat
 	if operationStat.Operation == keyWord {
 		pathArr := strings.Split(mountPath, "/")
 		pvName := pathArr[len(pathArr)-2]
+		if len((*pvNameStatMapping)[pvName]) >= NFSMetricsCount {
+			return
+		}
 		(*pvNameStatMapping)[pvName] = append((*pvNameStatMapping)[pvName], strconv.Itoa(int(operationStat.Requests)))
 		(*pvNameStatMapping)[pvName] = append((*pvNameStatMapping)[pvName], strconv.Itoa(int(operationStat.Transmissions)))
 		(*pvNameStatMapping)[pvName] = append((*pvNameStatMapping)[pvName], strconv.Itoa(int(operationStat.MajorTimeouts)))
@@ -409,41 +422,32 @@ func addNfsStat(pvNameStatMapping *map[string][]string, mountPath string, operat
 	}
 }
 
-func getNfsCapacityStat(pvName string, info nfsInfo, stat *[]string, p *nfsStatCollector) error {
+func getNfsCapacityStat(pvName string, info nfsInfo, p *nfsStatCollector) ([]string, error) {
 	response, err := p.httpClient.Get("multi-cnfs-nas", pvName)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	body := p.httpClient.ReadBody(response)
 	defer p.httpClient.Close(response)
 	m := make(map[string]nfsCapacityInfo, 0)
 	err = json.Unmarshal([]byte(body), &m)
 	if err != nil {
-		log.Errorf("Json unmarshal is failed, body:%+v, err:%s", body, err)
-		return err
+		return nil, fmt.Errorf("parse response: %w", err)
 	}
 	value, ok := m[pvName]
 	if ok && value.TotalSize != -1 && value.UsedSize != -1 {
 		p.capacityEventAlert(value.TotalSize, value.UsedSize, pvName, info)
-		*stat = append(*stat, strconv.Itoa(int(value.TotalSize)*GBSIZE))
-		*stat = append(*stat, strconv.Itoa(int(value.UsedSize)*GBSIZE))
-		*stat = append(*stat, strconv.Itoa((int(value.TotalSize)-int(value.UsedSize))*GBSIZE))
-	} else {
-		mountPath := strings.Replace(info.VolDataPath, "/vol_data.json", "", -1)
-		if len(mountPath) == 0 {
-			return errors.New("MountPath is empty")
-		}
-		mountPath = mountPath + "/mount"
-		available, capacity, usage, _, _, _, err := fs.FsInfo(mountPath)
-		if err != nil {
-			log.Errorf("Get fs info %s is failed,err:%s", mountPath, err)
-			return err
-		}
-		*stat = append(*stat, strconv.Itoa(int(capacity)))
-		*stat = append(*stat, strconv.Itoa(int(usage)))
-		*stat = append(*stat, strconv.Itoa(int(available)))
+		total := value.TotalSize * GBSIZE
+		used := value.UsedSize * GBSIZE
+		return []string{
+			strconv.FormatInt(total, 10),
+			strconv.FormatInt(used, 10),
+			strconv.FormatInt(total-used, 10),
+		}, nil
 	}
-	return nil
+	// NOTE: The system is unable to extract the capacity statistics because the capacity of the NFS mount point is based
+	// on the overall quota of the NAS filesystem, rather than the specific path that is mounted.
+	return nil, errors.New("capacity metrics from storage-monitor missing or invalid")
 }
 
 func (p *nfsStatCollector) capacityEventAlert(totalSize int64, usedSize int64, pvName string, info nfsInfo) {

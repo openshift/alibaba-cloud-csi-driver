@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -20,8 +21,12 @@ const (
 func MaintainSparseTemplateFile(dir string, size string) error {
 	ld := NewLoopDevice(dir, size)
 	templateDir, templateSize := ld.GetTemplateInfo()
+	err := EnsureFolder(templateDir)
+	if err != nil {
+		return err
+	}
 	tempFileName := filepath.Join(templateDir, LOCAL_SPARSE_TEMPLATE_NAME)
-	_, err := os.Stat(tempFileName)
+	_, err = os.Stat(tempFileName)
 	if os.IsNotExist(err) {
 		err = ld.CreateSparseFile(tempFileName, strconv.Itoa(int(utils.Gi2Bytes(int64(templateSize)))))
 		if err != nil {
@@ -38,11 +43,13 @@ type LoopDevice interface {
 	CopySparseFile(sourceFile, targetFile string) error
 	CreateLoopDevice(sparseFile string) (string, error)
 	DeleteLoopDevice(sparseFile string) (string, error)
+	SafeDeleteLoopDevice(sparseFile string) (string, error)
 	ResizeLoopDevice(sparseFile string) error
 	FindLoopDeviceBySparseFile(sparseFile string) (string, error)
 	GetTemplateInfo() (string, int)
 	FileExists(filepath string) error
 	GetUsedByteSize() (int64, error)
+	GetTempDirTotalCapacity() (int64, error)
 }
 
 type NodeLoopDevice struct {
@@ -60,6 +67,21 @@ func NewLoopDevice(templateDir, templateSize string) LoopDevice {
 		templateDir:  templateDir,
 		templateSize: size,
 	}
+}
+
+func (ld *NodeLoopDevice) GetTempDirTotalCapacity() (int64, error) {
+	cmd := fmt.Sprintf("%s df %s | awk '!/1K-blocks/{print $2}'", NsenterCmd, ld.templateDir)
+	out, err := utils.Run(cmd)
+	if err != nil {
+		return 0, err
+	}
+	out = strings.Trim(out, "\n")
+	totalCapacity, err := strconv.Atoi(out)
+	if err != nil {
+		return 0, err
+	}
+	totalBytes := utils.KBlock2Bytes(int64(totalCapacity))
+	return totalBytes, nil
 }
 
 func (ld *NodeLoopDevice) GetTemplateInfo() (string, int) {
@@ -90,9 +112,7 @@ func (ld *NodeLoopDevice) CustomFormatFile(fullName, fsType string, options []st
 	}
 	args := []string{}
 	if len(options) != 0 {
-		for _, opts := range options {
-			args = append(args, opts)
-		}
+		args = append(args, options...)
 	}
 	args = append(args, fullName)
 	_, err := exec.Command(fmt.Sprintf("%s mkfs.%s", utils.NsenterCmd, fsType), args...).CombinedOutput()
@@ -148,6 +168,37 @@ func (ld *NodeLoopDevice) DeleteLoopDevice(sparseFile string) (string, error) {
 		return "", err
 	}
 
+	return out, nil
+}
+
+// SafeDeleteLoopDevice checks if loopdevice mounted before deleting it.
+// An error will be promoted if loopdevice currently mounted.
+func (ld *NodeLoopDevice) SafeDeleteLoopDevice(sparseFile string) (string, error) {
+	loopDevice, err := ld.FindLoopDeviceBySparseFile(sparseFile)
+	if err != nil {
+		return "", fmt.Errorf("SafeDeleteLoopDevice: failed to find loopdevice by sparsefile: %v", err)
+	}
+	if loopDevice != "" {
+		mounted, err := utils.NewMounter().IsMounted(loopDevice)
+		if err != nil {
+			return "", fmt.Errorf("SafeDeleteLoopDevice: failed to check mount points of %q: %v", loopDevice, err)
+		}
+		if mounted {
+			return "", errors.New("SafeDeleteLoopDevice: loopdevice is currently mounted")
+		}
+
+		cmd := fmt.Sprintf("%s losetup -d %s", utils.NsenterCmd, loopDevice)
+		_, err = utils.Run(cmd)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	sfCmd := fmt.Sprintf("%s rm %s", utils.NsenterCmd, sparseFile)
+	out, err := utils.Run(sfCmd)
+	if err != nil {
+		return "", err
+	}
 	return out, nil
 }
 

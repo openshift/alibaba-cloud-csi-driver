@@ -16,15 +16,20 @@ os_release_exist=$?
 
 if [[ "$os_release_exist" = "0" ]]; then
     osID=`${HOST_CMD} cat /etc/os-release | grep "ID=" | grep -v "VERSION_ID"`
-    osVersion=`${HOST_CMD} cat /etc/os-release | grep "VERSION_ID=" | grep "^VERSION_ID=\"3"`
-    if [[ `echo ${osID} | grep "alinux" | wc -l` != "0" ]] && [[ "${osVersion}" ]]; then
-        host_os="alinux3"
+    if [[ `echo ${osID} | grep "alinux" | wc -l` != "0" ]]; then
+        osVersion=`${HOST_CMD} cat /etc/os-release | grep "VERSION_ID=" | grep "^VERSION_ID=\"3"`
+        if [[ "${osVersion}" ]]; then
+            host_os="alinux3"
+        fi
     fi
 		if [[ `echo ${osID} | grep "lifsea" | wc -l` != "0" ]]; then
         host_os="lifsea"
     fi
     if [[ `echo ${osID} | grep "anolis" | wc -l` != "0" ]]; then
-        host_os="anolis"
+        osVersion=`${HOST_CMD} cat /etc/os-release | grep "VERSION_ID=" | grep "^VERSION_ID=\"8"`
+        if [[ "${osVersion}" ]]; then
+            host_os="anolis8"
+        fi
     fi
 fi
 
@@ -77,16 +82,25 @@ done
 if [ "$run_oss" = "true" ]; then
     ossfsVer="1.80.6.ack.1"
     if [ "$USE_UPDATE_OSSFS" == "" ]; then
-        ossfsVer="1.88.0"
+        ossfsVer="1.88.1"
     fi
 
     ossfsArch="centos7.0"
-    if [[ ${host_os} == "alinux3" ]]; then
-        ${HOST_CMD} yum install -y libcurl-devel libxml2-devel fuse-devel openssl-devel
+    if [[ ${host_os} == "alinux3" ]] || [[ ${host_os} == "anolis8" ]]; then
+        for((i=1;i<=10;i++));
+        do
+            ${HOST_CMD} yum install -y libcurl-devel libxml2-devel fuse-devel openssl-devel
+            if [ $? -eq 0 ]; then
+                break
+            else
+                echo "Starting retry again yum install -y libcurl-devel libxml2-devel fuse-devel openssl-devel.retry count:$i"
+                sleep 2
+            fi
+        done
         ossfsArch="centos8"
     fi
 
-		if [[ ${host_os} == "lifsea" ]] || [[ ${host_os} == "anolis" ]]; then
+		if [[ ${host_os} == "lifsea" ]]; then
         ossfsArch="centos8"
     fi
 
@@ -94,6 +108,38 @@ if [ "$run_oss" = "true" ]; then
     echo "osHost:"${host_os}
     echo "ossfsVersion:"${ossfsVer}
     echo "ossfsArch:"${ossfsArch}
+
+    # ensure openssl
+    opensslVer=`${HOST_CMD}   openssl version | awk '{print $2}'` 
+    if [ ! `${HOST_CMD}  which openssl` ] || [[ "$opensslVer" =~ ^0.* ]]; then
+        for((i=1;i<=10;i++));
+        do
+            ${HOST_CMD} yum install -y openssl
+            if [ $? -eq 0 ]; then
+                opensslVer=`${HOST_CMD}   openssl version | awk '{print $2}'` 
+                echo "OpenSSL has installed : $opensslVer"
+                break
+            else
+                echo "Starting retry install OpenSSL .retry count:$i"
+            fi
+        done
+    fi  
+
+    sslDevelVer=`${HOST_CMD}  rpm -q openssl-devel`
+    if [ $? -ne 0 ]; then
+        for((i=1;i<=10;i++));
+        do
+            ${HOST_CMD} yum install -y openssl-devel
+            if [ $? -eq 0 ]; then
+                sslDevelVer=`${HOST_CMD}  rpm -q openssl-devel`
+                echo "OpenSSL-devel has installed : $sslDevelVer"
+                break
+            else
+                echo "Starting retry install OpenSSL-devel .retry count:$i"
+            fi
+        done
+    fi
+
 
     # install OSSFS
     mkdir -p /host/etc/csi-tool/
@@ -116,23 +162,63 @@ if [ "$run_oss" = "true" ]; then
 
 	if [[ ${reconcileOssFS} == "install" ]]; then
       if [[ ${host_os} == "lifsea" ]]; then
-          rpm2cpio /root/ossfs_${ossfsVer}_${ossfsArch}_x86_64.rpm | cpio -idmv
+          for((i=1;i<=5;i++));
+          do
+            echo "Starting install ossfs in ${host_os}."
+            rpm2cpio /root/ossfs_${ossfsVer}_${ossfsArch}_x86_64.rpm | cpio -idmv
+            if [ $? -eq 0 ]; then
+                break
+            else
+                echo "Starting retry again install ossfs in ${host_os}.retry count:$i"
+                sleep 2
+            fi
+          done
           cp ./usr/local/bin/ossfs /host/etc/csi-tool/
           ${HOST_CMD} cp /etc/csi-tool/ossfs /usr/local/bin/ossfs
       else
-          ${HOST_CMD} rpm -i /etc/csi-tool/ossfs_${ossfsVer}_${ossfsArch}_x86_64.rpm
+          for((i=1;i<=5;i++));
+          do
+            echo "Starting install ossfs in ${host_os}."
+            ${HOST_CMD} rpm -i /etc/csi-tool/ossfs_${ossfsVer}_${ossfsArch}_x86_64.rpm
+            if [ $? -eq 0 ]; then
+                break
+            else
+                echo "Starting retry again install ossfs in ${host_os}.retry count:$i"
+                sleep 2
+            fi
+          done
       fi
     fi
 
     if [[ ${reconcileOssFS} == "upgrade" ]]; then
       if [[ ${host_os} == "lifsea" ]]; then
           ${HOST_CMD}  rm /usr/local/bin/ossfs
-          rpm2cpio /root/ossfs_${ossfsVer}_${ossfsArch}_x86_64.rpm | cpio -idmv
+          for((i=1;i<=5;i++));
+          do
+            echo "Starting upgrade ossfs in ${host_os}."
+            rpm2cpio /root/ossfs_${ossfsVer}_${ossfsArch}_x86_64.rpm | cpio -idmv
+            if [ $? -eq 0 ]; then
+                break
+            else
+                echo "Starting retry again upgrade ossfs in ${host_os}.retry count:$i"
+                sleep 2
+            fi
+          done
           cp ./usr/local/bin/ossfs /host/etc/csi-tool/
           ${HOST_CMD}  cp /etc/csi-tool/ossfs /usr/local/bin/ossfs
       else
           ${HOST_CMD}  yum remove -y ossfs
-          ${HOST_CMD}  rpm -i /etc/csi-tool/ossfs_${ossfsVer}_${ossfsArch}_x86_64.rpm
+          for((i=1;i<=5;i++));
+          do
+            echo "Starting upgrade ossfs in ${host_os}."
+            ${HOST_CMD} rpm -i /etc/csi-tool/ossfs_${ossfsVer}_${ossfsArch}_x86_64.rpm
+            if [ $? -eq 0 ]; then
+                break
+            else
+                echo "Starting retry again upgrade ossfs in ${host_os}.retry count:$i"
+                sleep 2
+            fi
+          done
       fi
     fi
 
@@ -152,7 +238,8 @@ if [ "$run_oss" = "true" ]; then
     #fi
 fi
 
-if [ "$run_oss" = "true" ] || [ "$run_disk" = "true" ]; then
+# skip installing csiplugin-connector when DISABLE_CSIPLUGIN_CONNECTOR=true
+if [ "$DISABLE_CSIPLUGIN_CONNECTOR" != "true" ] && ([ "$run_oss" = "true" ] || [ "$run_disk" = "true" ]); then
     ## install/update csi connector
     updateConnector="true"
 	systemdDir="/host/usr/lib/systemd/system"
@@ -171,6 +258,7 @@ if [ "$run_oss" = "true" ] || [ "$run_disk" = "true" ]; then
             rm -rf /host/etc/csi-tool/
             rm -rf /host/etc/csi-tool/connector.sock
             rm -rf /var/log/alicloud/connector.pid
+            rm -rf /var/run/csiplugin/connector.pid
             mkdir -p /host/etc/csi-tool/
         fi
     fi
@@ -205,34 +293,81 @@ if [ "$run_oss" = "true" ] || [ "$run_disk" = "true" ]; then
         echo "Install csiplugin connector service...."
         cp /csi/csiplugin-connector.service $systemdDir/csiplugin-connector.service
         echo "Starting systemctl daemon-reload."
-        until ${HOST_CMD} systemctl daemon-reload
+        for((i=1;i<=10;i++));
         do
-            echo "Starting retry again systemctl daemon-reload."
-            sleep 2
+            ${HOST_CMD} systemctl daemon-reload
+            if [ $? -eq 0 ]; then
+                break
+            else
+                echo "Starting retry again systemctl daemon-reload.retry count:$i"
+                sleep 2
+            fi
         done
     fi
 
     rm -rf /var/log/alicloud/connector.pid
+    rm -rf /var/run/csiplugin/connector.pid
     echo "Starting systemctl enable csiplugin-connector.service."
-    until ${HOST_CMD} systemctl enable csiplugin-connector.service
+    for((i=1;i<=5;i++));
     do
-        echo "Starting retry again systemctl enable csiplugin-connector.service."
-        sleep 2
+        ${HOST_CMD} systemctl enable csiplugin-connector.service
+        if [ $? -eq 0 ]; then
+            break
+        else
+            echo "Starting retry again systemctl enable csiplugin-connector.service.retry count:$i"
+            sleep 2
+        fi
     done
+
     echo "Starting systemctl restart csiplugin-connector.service."
-    until ${HOST_CMD} systemctl restart csiplugin-connector.service
+    for((i=1;i<=5;i++));
     do
-        echo "Starting retry again systemctl restart csiplugin-connector.service."
-        sleep 2
+        ${HOST_CMD} systemctl restart csiplugin-connector.service
+        if [ $? -eq 0 ]; then
+            break
+        else
+            echo "Starting retry again systemctl restart csiplugin-connector.service.retry count:$i"
+            sleep 2
+        fi
     done
+fi
+
+echo "Start checking if the rpm package needs to be installed"
+if [ "$DISK_BDF_ENABLE" = "true" ] && [ "$run_disk" = "true" ]; then
+    isbdf="false"
+    for i in $(${HOST_CMD} lspci -D | grep "storage controller" | grep "1ded" | awk '{print $1}' |  sed -n '/0$/p'); 
+    do 
+        out=`${HOST_CMD} lspci -s $i -v`;
+        if [[ $out == *"Single Root I/O Virtualization"* ]]; then
+            isbdf="true"
+            break
+        fi
+    done
+    export IS_BDF="$isbdf"
+    echo "isbdf node: $isbdf"
+    if [ $isbdf = "true" ]; then
+        echo "start install vfhp"
+        ${HOST_CMD} yum install -y "http://yum.tbsite.net/taobao/7/x86_64/current/iohub-vfhp-helper/iohub-vfhp-helper-0.1.3-20230417103419.x86_64.rpm"
+        if [ $? -ne 0 ]; then
+            ${HOST_CMD} yum install -y "https://iohub-vfhp-helper.oss-rg-china-mainland.aliyuncs.com/iohub-vfhp-helper-0.1.3-20230417103419.x86_64.rpm"
+        fi
+        # takes 10s
+        output=`${HOST_CMD} iohub-vfhp-helper -s`
+        if [[ $output == *"backend support auto vf hotplug."* ]]; then
+            echo "backend support auto vf hotplugin"
+            ${HOST_CMD} sudo service iohub-vfhp-helper start
+        else
+            echo "backend not support auto vf hotplugin"
+        fi
+    fi
 fi
 
 ## CPFS-NAS plugin setup
 if [ "$run_nas" = "true" ]; then
     # cpfs-nas nas-rich-client common rpm
-    cp /root/aliyun-alinas-utils-1.1-4.al7.noarch.rpm /host/etc/csi-tool/
+    cp /root/aliyun-alinas-utils-1.1-6.al7.noarch.rpm /host/etc/csi-tool/
     # nas-rich-client rpm
-    cp /root/alinas-eac-1.2-1.x86_64.rpm /host/etc/csi-tool/
+    cp /root/alinas-efc-1.2-3.x86_64.rpm /host/etc/csi-tool/
 fi
 
 ## Jindofs plugin setup
