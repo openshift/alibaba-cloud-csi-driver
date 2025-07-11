@@ -58,7 +58,7 @@ require (
 	github.com/go-logr/logr v1.2.3 // indirect
 	github.com/golang/glog v0.0.0-20160126235308-23def4e6c14b // indirect
 	github.com/golang/groupcache v0.0.0-20200121045136-8c9f03a8e57e // indirect
-	github.com/google/go-cmp v0.5.5 // indirect
+	github.com/google/go-cmp v0.6.0 // indirect
 	github.com/google/gofuzz v1.1.0 // indirect
 	github.com/googleapis/gnostic v0.4.1 // indirect
 	github.com/gorilla/mux v1.7.0 // indirect
@@ -101,6 +101,7 @@ require (
 replace (
 	github.com/beorn7/perks => github.com/beorn7/perks v0.0.0-20180321164747-3a771d992973
 	github.com/evanphx/json-patch => github.com/evanphx/json-patch v3.0.0+incompatible
+	github.com/golang/glog => github.com/golang/glog v1.2.4
 	github.com/golang/mock => github.com/golang/mock v1.1.1
 	github.com/google/go-cmp => github.com/google/go-cmp v0.5.0
 	github.com/google/gofuzz => github.com/google/gofuzz v0.0.0-20170612174753-24818f796faf
