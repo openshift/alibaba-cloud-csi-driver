@@ -24,7 +24,7 @@ require (
 	github.com/prometheus/procfs v0.7.3
 	github.com/rifflock/lfshook v0.0.0-20180920164130-b9218ef580f5
 	github.com/sevlyar/go-daemon v0.1.5
-	github.com/sirupsen/logrus v1.8.1
+	github.com/sirupsen/logrus v1.8.3
 	github.com/stretchr/testify v1.7.0
 	go.uber.org/ratelimit v0.1.0
 	golang.org/x/net v0.17.0
